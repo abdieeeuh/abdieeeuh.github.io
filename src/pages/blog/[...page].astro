@@ -1,0 +1,95 @@
+---
+import BlogCard from '@/components/blog-card.astro'
+import Breadcrumbs from '@/components/breadcrumbs.astro'
+import Link from '@/components/link.astro'
+import PageHead from '@/components/page-head.astro'
+import PaginationComponent from '@/components/ui/pagination'
+import { SITE } from '@/consts'
+import Layout from '@/layouts/layout.astro'
+import {
+  getAllPosts,
+  getSortedCategories,
+  groupPostsByYear,
+} from '@/lib/data-utils'
+import { formatLabel } from '@/lib/utils'
+import type { PaginateFunction } from 'astro'
+
+export async function getStaticPaths({
+  paginate,
+}: {
+  paginate: PaginateFunction
+}) {
+  const allPosts = await getAllPosts()
+  return paginate(allPosts, { pageSize: SITE.postsPerPage })
+}
+
+const { page } = Astro.props
+
+const postsByYear = groupPostsByYear(page.data)
+const years = Object.keys(postsByYear).sort((a, b) => parseInt(b) - parseInt(a))
+const sortedCategories = await getSortedCategories()
+---
+
+<Layout class="max-w-3xl">
+  <PageHead slot="head" title="Blog" />
+  <Breadcrumbs
+    items={[
+      { label: 'Blog', href: '/blog', icon: 'lucide:library-big' },
+      { label: `Page ${page.currentPage}`, icon: 'lucide:book-copy' },
+    ]}
+  />
+
+  <div class="flex min-h-[calc(100vh-18rem)] flex-col gap-y-8">
+    <section class="flex flex-col gap-y-3">
+      <div class="flex items-center justify-between gap-3">
+        <h2 class="font-medium">Categories</h2>
+        <Link
+          href="/categories"
+          class="text-muted-foreground text-sm hover:text-foreground"
+        >
+          View all categories
+        </Link>
+      </div>
+
+      <ul class="grid gap-3 sm:grid-cols-2">
+        {
+          sortedCategories.map(({ category, count }) => (
+            <li>
+              <Link
+                href={`/categories/${category}`}
+                class="hover:bg-muted/40 flex items-center justify-between rounded-md border p-3 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md"
+              >
+                <span class="font-medium">{formatLabel(category)}</span>
+                <span class="bg-muted text-muted-foreground rounded-full px-2 py-0.5 text-xs">
+                  {count}
+                </span>
+              </Link>
+            </li>
+          ))
+        }
+      </ul>
+    </section>
+
+    {
+      years.map((year) => (
+        <section class="flex flex-col gap-y-4">
+          <div class="font-medium">{year}</div>
+          <ul class="flex flex-col gap-4">
+            {postsByYear[year].map((post) => (
+              <li>
+                <BlogCard entry={post} />
+              </li>
+            ))}
+          </ul>
+        </section>
+      ))
+    }
+  </div>
+
+  <PaginationComponent
+    currentPage={page.currentPage}
+    totalPages={page.lastPage}
+    baseUrl="/blog/"
+    client:load
+  />
+</Layout>

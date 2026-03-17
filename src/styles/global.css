@@ -1,0 +1,129 @@
+@import 'tailwindcss';
+
+@custom-variant dark (&:where([data-theme=dark], [data-theme=dark] *));
+
+@theme inline {
+  --font-sans:
+    Geist, ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji',
+    'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+  --font-mono:
+    Geist Mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    'Liberation Mono', 'Courier New', monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+}
+
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/GeistVF.woff2') format('woff2-variations');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Geist Mono';
+  src: url('/fonts/GeistMonoVF.woff2') format('woff2-variations');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --background: oklch(0.978 0.007 148);
+  --foreground: oklch(0.205 0.02 184);
+  --primary: oklch(0.44 0.11 156);
+  --primary-foreground: oklch(0.985 0.004 140);
+  --muted: oklch(0.948 0.008 164);
+  --muted-foreground: oklch(0.45 0.017 188);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.878 0.012 175);
+  --ring: oklch(0.64 0.08 162);
+  --bg-grid: color-mix(in oklab, var(--primary) 7%, transparent);
+  --bg-scan: color-mix(in oklab, var(--foreground) 3%, transparent);
+  --bg-glow-strong: color-mix(in oklab, var(--primary) 20%, transparent);
+  --bg-glow-soft: color-mix(in oklab, var(--primary) 10%, transparent);
+  --bg-depth: color-mix(in oklab, var(--background) 88%, black 12%);
+}
+
+[data-theme='dark'] {
+  --background: oklch(0.16 0.012 178);
+  --foreground: oklch(0.94 0.014 148);
+  --primary: oklch(0.74 0.11 156);
+  --primary-foreground: oklch(0.19 0.012 185);
+  --muted: oklch(0.225 0.012 182);
+  --muted-foreground: oklch(0.73 0.01 162);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(0.34 0.015 180 / 55%);
+  --ring: oklch(0.71 0.075 156);
+  --bg-grid: color-mix(in oklab, var(--primary) 9%, transparent);
+  --bg-scan: color-mix(in oklab, var(--foreground) 5%, transparent);
+  --bg-glow-strong: color-mix(in oklab, var(--primary) 24%, transparent);
+  --bg-glow-soft: color-mix(in oklab, var(--primary) 12%, transparent);
+  --bg-depth: color-mix(in oklab, var(--background) 82%, black 18%);
+}
+
+@layer base {
+  html {
+    background: var(--background);
+  }
+
+  body {
+    min-height: 100vh;
+    background-color: var(--background);
+    background-image:
+      radial-gradient(circle at 14% 0%, var(--bg-glow-strong), transparent 34%),
+      radial-gradient(circle at 86% 12%, var(--bg-glow-soft), transparent 28%),
+      linear-gradient(var(--bg-grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px),
+      repeating-linear-gradient(
+        180deg,
+        var(--bg-scan) 0,
+        var(--bg-scan) 1px,
+        transparent 1px,
+        transparent 4px
+      ),
+      linear-gradient(
+        180deg,
+        var(--bg-depth),
+        color-mix(in oklab, var(--background) 97%, var(--primary) 3%) 38%,
+        var(--background)
+      );
+    background-size:
+      auto,
+      auto,
+      72px 72px,
+      72px 72px,
+      100% 4px,
+      auto;
+    background-position:
+      left top,
+      right top,
+      center top,
+      center top,
+      center top,
+      center top;
+    color: var(--foreground);
+  }
+
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    @apply border-border outline-ring/50 tracking-tight;
+  }
+}

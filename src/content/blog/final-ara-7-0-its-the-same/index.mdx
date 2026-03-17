@@ -1,0 +1,840 @@
+---
+title: "Final ARA 7.0 - It's the same"
+description: 'DSA-like scheme broken by structured nonces, hidden-number recovery, and signature forgery.'
+date: 2026-03-17
+category: 'final-ara-7-0'
+discipline: 'cryptography'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: I solved this challenge with LLM
+
+This challenge is a good example of a crypto problem that looks like “just another DSA variant” until the nonce handling is read carefully. The break was not a generic discrete-log attack. It came from forcing the signer into a weak nonce mode, then using the resulting hidden-number leakage to recover the private key and forge a valid access signature.
+
+The nice part is that the solve is structured. Every stage gives one missing piece:
+
+- recover the signing exponent `e`
+- recover a multiple of `n`
+- recover the private key `x`
+- reconstruct an equivalent access message
+- forge a signature for the printed challenge hash
+
+## Challenge Information
+
+- Category: Cryptography
+- Difficulty: Hard (subjective)
+- Event: Final ARA 7.0
+- Service: `nc chall-ctf.ara-its.id 9999`
+- Attachments / source code: `release.py` and `solve.py`
+- Goal: obtain a valid signature for the access check and recover the flag
+
+The captured flag was:
+
+```text
+ARA7{allow_allow_allow_allow_allow_access_granted}
+```
+
+## Initial Analysis
+
+The core code in `release.py` defines a DSA-like signature system:
+
+```python
+def sign(params):
+    e, m, p, q, g, x, k = params
+    n = p * q
+    h = H(m, e, n)
+    r = pow(g, k, p) % q
+    s = ((h + x * r) * pow(k, -1, q)) % q
+    return (r, s, h, q), randbelow(1 << (g%(e>>myfavnum))) + (1 << 1024)
+```
+
+At first glance this looks like a customized DSA:
+
+- `q` is a large prime
+- `p = e*k*q + 1` is chosen prime
+- `g` is a subgroup generator
+- the signature equation is the familiar
+  `s = (h + x*r) / k mod q`
+
+The unusual parts are:
+
+- the hash function `H(msg, e, n) = (m mod n)^e mod n`
+- the public exponent `e` is a 21-bit prime
+- the next nonce depends on `g % (e >> 9)`
+- invalid signing input resets the nonce in a predictable way
+
+That last point is the real bug. The whole solve starts there.
+
+## Initial Analysis
+
+The interaction loop is simple:
+
+```python
+while remaining:
+    usr_input = input("sign or get access? (s/g/e for exit) : ").strip().lower()
+```
+
+The service lets us:
+
+- request signatures
+- enter an access challenge mode
+- exit
+
+The critical branch is what happens after an invalid signing input:
+
+```python
+if new_k:
+    k = new_k
+    remaining.pop()
+else:
+    k = randbelow(1 << (g%(e>>myfavnum))) + (1 << 1024)
+    print("Invalid message!")
+```
+
+So by intentionally sending bad hex once, we can force all later nonces into the form:
+
+```text
+k = 2^1024 + delta
+```
+
+with a relatively small unknown `delta`.
+
+That is not random enough for DSA-like signatures. It is exactly the kind of structured nonce leakage that turns into a Hidden Number Problem.
+
+## Recon / Enumeration
+
+Since the service is already down, the enumeration here is really protocol inspection plus code review.
+
+The signing prompt was:
+
+```text
+sign what? (hex) :
+```
+
+and the access prompt was:
+
+```text
+access code and signature? ((m_hex, r, s)) :
+```
+
+The attack plan that falls out of the source is:
+
+1. Force weak nonces with one invalid signing request.
+2. Collect a small set of signatures on carefully chosen messages.
+3. Recover `e`.
+4. Recover a multiple of `n`.
+5. Recover the private key `x` from the weak nonces.
+6. Enter access mode and read the printed integrity value.
+7. Build a congruent message that passes the length guard.
+8. Forge a valid signature and submit it.
+
+The included solver uses the messages:
+
+```text
+02, 04, 08, 10
+```
+
+These are not arbitrary. They make the custom hash algebra much easier to exploit.
+
+## Vulnerability Discovery
+
+### 1. Broken nonce reset
+
+The vulnerability starts with this line:
+
+```python
+k = randbelow(1 << (g%(e>>myfavnum))) + (1 << 1024)
+```
+
+where `myfavnum = 9`.
+
+That means after one invalid sign request:
+
+```text
+k = 2^1024 + delta
+delta < 2^t
+t = g % (e >> 9)
+```
+
+So each nonce is “known large constant + small error”.
+
+For DSA-style signatures, even partial nonce information is dangerous. The signature equation is:
+
+```text
+s_i * k_i = h_i + x * r_i  mod q
+```
+
+If `k_i` has this constrained form, then `x` can often be recovered with lattice techniques.
+
+### 2. Small search space for `e`
+
+The parameter `e` is only a 21-bit prime:
+
+```python
+e = getPrime(21)
+```
+
+So:
+
+```text
+e in [2^20, 2^21)
+```
+
+That is small enough for a short-interval discrete log using baby-step giant-step.
+
+### 3. Recoverable multiple of `n`
+
+The custom hash is:
+
+```python
+def H(msg, e, n):
+    return pow(bytes_to_long(msg)%n, e, n)
+```
+
+If we sign messages whose integer values are `2, 4, 8, 16`, then:
+
+```text
+H(2^i) = 2^(i*e) mod n
+```
+
+Therefore:
+
+```text
+D_i = 2^(i*e) - H(2^i)
+```
+
+is always a multiple of `n`.
+
+Taking a gcd across several such differences gives a positive multiple of `n`, which is enough for the final message-congruence trick.
+
+### 4. Weak access check
+
+When the user asks for access, the service generates a fresh random code and prints:
+
+```python
+print(f"code integrity: {H(access_code.encode(),e,n)}")
+```
+
+Then it verifies our submitted `(m_hex, r, s)` and only checks:
+
+```python
+return H(m,e,n) == H(access_code.encode(), e, n)
+```
+
+This is weaker than comparing the exact original message. Any message congruent modulo `n` under the custom hash is accepted.
+
+That is what allows the final length-bypass trick.
+
+## Exploitation
+
+The solve works in five stages.
+
+### Step 1: Force the signer into weak-nonce mode
+
+The first request is intentionally invalid:
+
+```text
+zz
+```
+
+That causes the service to take the failure branch and reset `k` to:
+
+```text
+2^1024 + small_random
+```
+
+From that point on, the next signatures leak information about the secret key.
+
+### Step 2: Collect four signatures on powers of two
+
+The solver asks for signatures on:
+
+```text
+02
+04
+08
+10
+```
+
+For each, the service returns:
+
+```text
+(r, s, h, q)
+```
+
+These signatures are enough to:
+
+- recover `e` from `H(2) mod q`
+- recover a multiple of `n`
+- set up the Hidden Number Problem for `x`
+
+### Step 3: Recover `e`
+
+Because `e` is only 21 bits and:
+
+```text
+h2 = H(2) = 2^e mod n
+```
+
+we also know:
+
+```text
+h2 mod q = 2^e mod q
+```
+
+So recovering `e` is just a discrete log in the interval `[2^20, 2^21)`.
+
+The solver does this with baby-step giant-step:
+
+```python
+def recover_e_from_h2(h_mod_q, q):
+    ...
+```
+
+This is much cheaper than a generic discrete log because the interval is tiny.
+
+### Step 4: Recover a multiple of `n`
+
+Using the recovered `e` and the recorded hashes:
+
+```text
+d1 = 2^e - H(2)
+d2 = 2^(2e) - H(4)
+d3 = 2^(3e) - H(8)
+d4 = 2^(4e) - H(16)
+```
+
+Each `d_i` is a multiple of `n`, so:
+
+```text
+gcd(d1, d2, d3, d4)
+```
+
+gives a positive multiple of `n`.
+
+The solver calls this `n_multiple`.
+
+Important detail: we do not need the exact `n`. A multiple is good enough because we only need to construct another integer that is congruent to the real access code modulo `n`.
+
+### Step 5: Recover private key `x` with a lattice
+
+This is the core crypto break.
+
+For each signature:
+
+```text
+s_i * k_i = h_i + x * r_i  mod q
+```
+
+and since:
+
+```text
+k_i = alpha + delta_i
+alpha = 2^1024 mod q
+delta_i small
+```
+
+we can rewrite the equations into a standard bounded-error Hidden Number Problem.
+
+The solver computes:
+
+```text
+a_i = r_i * s_i^{-1} mod q
+d_i = alpha - h_i * s_i^{-1} mod q
+```
+
+so that:
+
+```text
+a_i * x - d_i = delta_i mod q
+```
+
+with small `delta_i`.
+
+That is exactly the kind of system that LLL/CVP can solve.
+
+The included solver uses `fpylll`:
+
+```python
+from fpylll import IntegerMatrix, LLL, CVP
+```
+
+and recovers:
+
+- `x`, the private key
+- the actual `k_i` values used in the collected signatures
+
+Once `x` is known, the challenge is effectively over.
+
+### Step 6: Enter access mode and read the target hash
+
+After key recovery, the solver chooses access mode:
+
+```text
+g
+```
+
+The service prints:
+
+```text
+code integrity: C
+```
+
+where:
+
+```text
+C = H(access_code.encode(), e, n)
+```
+
+This is the exact target hash our forged signature must match.
+
+### Step 7: Reconstruct the access code modulo `q`
+
+The access code comes from:
+
+```python
+access_code = token_hex()
+```
+
+So it is 64 ASCII hex characters, meaning the encoded integer is less than `2^512`.
+
+Since `q` is about 1024 bits, that encoded integer is definitely smaller than `q`. Therefore taking the `e`-th root modulo `q` recovers the exact integer value of the access code:
+
+```text
+access_int = (C mod q)^(e^{-1} mod (q-1)) mod q
+```
+
+That gives us the real access code integer, but not yet in a form that passes the service’s bit-length guard.
+
+### Step 8: Bypass the length guard with a congruent message
+
+The service includes this weird check:
+
+```python
+blen = 1 // (int(m_hex, 16) >> 511)
+```
+
+This forces the submitted integer to be larger than `2^511`.
+
+But the real `access_code.encode()` integer is smaller than that.
+
+The solution is to submit:
+
+```text
+m = access_int + n_multiple
+```
+
+Why this works:
+
+- `m` is now large enough to pass the bit-length guard
+- `m mod n == access_int mod n`
+- so `H(m, e, n) == H(access_code.encode(), e, n)`
+
+This is the key final trick: the service never requires the exact message, only a hash collision under its own modular definition.
+
+### Step 9: Forge a signature for the target hash
+
+Now that we know `x` and one valid nonce `k_i`, we can reuse any collected `r_i` and compute:
+
+```text
+s_new = (C + x * r_i) * k_i^{-1} mod q
+```
+
+Then `(r_i, s_new)` is a valid signature for the target hash `C`.
+
+Submit:
+
+```text
+(m_hex, r_i, s_new)
+```
+
+and access is granted.
+
+## Request / Interaction Flow
+
+The high-level interaction looks like this:
+
+```text
+sign or get access? (s/g/e for exit) : s
+sign what? (hex) : zz
+```
+
+Then collect signatures:
+
+```text
+s -> 02
+s -> 04
+s -> 08
+s -> 10
+```
+
+Then enter access mode:
+
+```text
+g
+```
+
+Read `code integrity: C`, compute the forgery offline, and submit:
+
+```text
+('<large congruent m_hex>', r, s)
+```
+
+## Working Exploit Script
+
+The included `solve.py` automates the full flow. These are the important pieces.
+
+Recover `e`:
+
+```python
+def recover_e_from_h2(h_mod_q, q):
+    """Recover e in [2^20, 2^21) from 2^e mod q using BSGS."""
+```
+
+Recover a multiple of `n`:
+
+```python
+def recover_n_multiple(e, hs):
+    d1 = (1 << e) - h2
+    d2 = (1 << (2 * e)) - h4
+    d3 = (1 << (3 * e)) - h8
+    d4 = (1 << (4 * e)) - h16
+    ...
+```
+
+Recover `x` with LLL/CVP:
+
+```python
+def recover_x_lattice(signs, q, t_guess=790):
+    ...
+    LLL.reduction(M)
+    vec = CVP.closest_vector(M, target)
+    x = vec[-1] % q
+```
+
+Forge the final signature:
+
+```python
+s_new = ((C + x * r0) * pow(k0, -1, q)) % q
+payload = f"('{m_hex}', {r0}, {s_new})\n".encode()
+```
+
+## Getting the Flag
+
+Once the forged tuple is accepted, the service prints `ACCESS GRANTED!` and then the flag:
+
+```text
+ARA7{allow_allow_allow_allow_allow_access_granted}
+```
+
+## Key Takeaways
+
+- The root problem was nonce leakage in a DSA-like scheme. Even partial structure in `k` can destroy the secret key.
+- The attack became practical because the challenge also made `e` unusually small and exposed enough algebra through the custom hash.
+- The final access check was weaker than it looked because it only compared modular hash equality, not the original message.
+- A single invalid-input branch can matter just as much as the normal signing code in cryptographic implementations.
+
+From a defensive perspective:
+
+- signature nonces must be uniformly random or deterministic in a proven-safe way
+- failure paths must not change nonce generation into a weaker mode
+- custom hash constructions inside signature schemes are dangerous unless they are formally justified
+- access checks should compare the actual signed message or a standard cryptographic digest, not a modular equivalence class that allows alternate representatives
+
+## Solver Script
+
+For reference, this is the full solver script used during the event. I also attached it as [solve.py](./solve.py), but the full code is included here directly so the post stays self-contained.
+
+```python
+#!/usr/bin/env python3
+import ast
+import sys
+import math
+import re
+import socket
+from math import gcd
+from fpylll import IntegerMatrix, LLL, CVP
+
+HOST = 'challenge.ara-its.id'
+PORT = 9999
+PROMPT = b'sign or get access? (s/g/e for exit) : '
+SIGN_PROMPT = b'sign what? (hex) : '
+ACCESS_PROMPT = b'access code and signature? ((m_hex, r, s)) : '
+
+# e is a 21-bit prime
+E_LOW = 1 << 20
+E_HIGH = 1 << 21
+
+
+def recv_until(sock, marker, timeout=8.0):
+    sock.settimeout(timeout)
+    data = b''
+    while marker not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def recover_e_from_h2(h_mod_q, q):
+    """Recover e in [2^20, 2^21) from 2^e mod q using BSGS on a short interval."""
+    base = 2
+    N = E_HIGH - E_LOW
+    m = int(math.isqrt(N)) + 1
+
+    baby = {}
+    cur = 1
+    for b in range(m):
+        baby.setdefault(cur, b)
+        cur = (cur * base) % q
+
+    factor = pow(base, -m, q)
+    gamma = (h_mod_q * pow(base, -E_LOW, q)) % q
+    for a in range(m + 1):
+        b = baby.get(gamma)
+        if b is not None:
+            e = E_LOW + a * m + b
+            if E_LOW <= e < E_HIGH:
+                return e
+        gamma = (gamma * factor) % q
+
+    return None
+
+
+def recover_n_multiple(e, hs):
+    """Recover any positive multiple of n from hashes of messages [2,4,8,16]."""
+    h2, h4, h8, h16 = hs
+
+    # Direct multiples of n: 2^(i*e) - H(2^i)
+    d1 = (1 << e) - h2
+    d2 = (1 << (2 * e)) - h4
+    d3 = (1 << (3 * e)) - h8
+    d4 = (1 << (4 * e)) - h16
+
+    g1 = 0
+    for d in (d1, d2, d3, d4):
+        g1 = gcd(g1, abs(d))
+
+    return g1 if g1 > 0 else None
+
+
+def recover_x_lattice(signs, q, t_guess=790):
+    """
+    Recover x from equations k_i = (h_i + x*r_i)/s_i mod q with
+    k_i = alpha + delta_i and delta_i < 2^t_guess.
+    """
+    alpha = (1 << 1024) % q
+    n = len(signs)
+
+    a = []
+    d = []
+    sinv = []
+
+    for r, s, h in signs:
+        invs = pow(s, -1, q)
+        sinv.append(invs)
+        a.append((r * invs) % q)
+        d.append((alpha - (h * invs) % q) % q)
+
+    l = (q.bit_length() - 1) - t_guess
+    if l < 1:
+        l = 1
+    scale = 1 << l
+
+    m = n + 1
+    M = IntegerMatrix(m, m)
+    for i in range(n):
+        M[i, i] = q * scale
+    for j in range(n):
+        M[n, j] = a[j] * scale
+    M[n, n] = 1
+
+    LLL.reduction(M)
+
+    target = [((x if x < q // 2 else x - q) * scale) for x in d] + [0]
+    vec = CVP.closest_vector(M, target)
+    x = vec[-1] % q
+
+    if x.bit_length() > 800:
+        return None
+
+    deltas = []
+    ks = []
+    for (r, s, h), invs in zip(signs, sinv):
+        k = ((h + x * r) * invs) % q
+        ks.append(k)
+        delta = (k - alpha) % q
+        deltas.append(delta)
+
+    if max(delta.bit_length() for delta in deltas) > t_guess:
+        return None
+
+    return x, ks, alpha
+
+
+def parse_sig_tuple(blob):
+    m = re.search(rb'\((\d+),\s*(\d+),\s*(\d+),\s*(\d+)\)', blob)
+    if not m:
+        return None
+    return tuple(int(x) for x in m.groups())
+
+
+def one_attempt(verbose=False):
+    s = socket.create_connection((HOST, PORT), timeout=10)
+    try:
+        banner = recv_until(s, PROMPT, timeout=60.0)
+        pub_m = re.search(rb'pub:\s*(\d+)', banner)
+        if pub_m:
+            _pub = int(pub_m.group(1))
+
+        # Force first usable nonce to weak form.
+        s.sendall(b's\n')
+        recv_until(s, SIGN_PROMPT, timeout=5.0)
+        s.sendall(b'zz\n')
+        recv_until(s, PROMPT, timeout=5.0)
+
+        msgs = [2, 4, 8, 16]
+        sigs = []
+
+        for m in msgs:
+            s.sendall(b's\n')
+            recv_until(s, SIGN_PROMPT, timeout=5.0)
+            mhex = format(m, 'x')
+            if len(mhex) % 2:
+                mhex = '0' + mhex
+            s.sendall(mhex.encode() + b'\n')
+            out = recv_until(s, PROMPT, timeout=5.0)
+            tup = parse_sig_tuple(out)
+            if tup is None:
+                short = out.decode(errors="ignore").replace("\n", "\\n")
+                return None, f"sig_parse:{short[:160]}"
+            r, ss, h, q = tup
+            sigs.append((m, r, ss, h, q))
+
+        q = sigs[0][4]
+        if any(t[4] != q for t in sigs):
+            return None, "q_mismatch"
+
+        # Recover private key from weak nonces.
+        rs_sh = [(r, ss, h) for (_, r, ss, h, _) in sigs]
+        rec = recover_x_lattice(rs_sh, q, t_guess=740)
+        if rec is None:
+            return None, "x_recover"
+        x, ks, alpha = rec
+
+        # Recover e quickly from H(2) mod q.
+        h2 = sigs[0][3] % q
+        e = recover_e_from_h2(h2, q)
+        if e is None:
+            return None, "e_recover"
+
+        # Consistency check with second message.
+        if pow(4, e, q) != (sigs[1][3] % q):
+            return None, "e_inconsistent"
+
+        # Enter access flow.
+        s.sendall(b'g\n')
+        out = recv_until(s, ACCESS_PROMPT, timeout=5.0)
+        m = re.search(rb'code integrity:\s*(\d+)', out)
+        if not m:
+            return None, "no_code_integrity"
+        C = int(m.group(1))
+
+        # Recover n late to maximize chance we reach code-integrity prompt.
+        hs = [t[3] for t in sigs]
+        n_multiple = recover_n_multiple(e, hs)
+        if n_multiple is None:
+            return None, "n_mult_recover"
+
+        # Recover access_code integer via q-root.
+        # access_code.encode() is 64 bytes (~512 bits), while q is ~1024 bits.
+        # So the value recovered modulo q is the exact integer.
+        if gcd(e, q - 1) != 1:
+            return None, "e_noninvert_q1"
+        dq = pow(e, -1, q - 1)
+        access_int = pow(C % q, dq, q)
+
+        # Must satisfy m >> 511 != 0; choose equivalent class representative.
+        m_int = access_int + n_multiple
+        m_hex = format(m_int, 'x')
+        if len(m_hex) % 2:
+            m_hex = '0' + m_hex
+
+        # Re-sign target hash C using one recovered nonce/signature slot.
+        picked = False
+        for (_, r0, s0, h0, _), k0 in zip(sigs, ks):
+            if k0 == 0:
+                continue
+            s_new = ((C + x * r0) * pow(k0, -1, q)) % q
+            if s_new != 0:
+                picked = True
+                break
+        if not picked:
+            return None, "no_sig_slot"
+
+        payload = f"('{m_hex}', {r0}, {s_new})\n".encode()
+        s.sendall(payload)
+        final = recv_until(s, b'\n', timeout=5.0) + s.recv(4096)
+
+        text = final.decode(errors='ignore')
+        if verbose:
+            print(text)
+
+        flag_m = re.search(r'(ARA7\{[^}\n]+\})', text)
+        if flag_m:
+            return flag_m.group(1), "flag"
+
+        if 'ACCESS GRANTED' in text:
+            # Some wrappers print flag on another line; try to read a bit more.
+            try:
+                more = s.recv(4096).decode(errors='ignore')
+                text += more
+            except Exception:
+                pass
+            flag_m = re.search(r'(ARA7\{[^}\n]+\})', text)
+            if flag_m:
+                return flag_m.group(1), "flag"
+
+        if "ACCESS GRANTED" in text:
+            return None, "granted_no_flag"
+        return None, "access_denied"
+    finally:
+        s.close()
+
+
+def main():
+    global HOST, PORT
+    if len(sys.argv) >= 2:
+        target = sys.argv[1]
+        if ":" in target:
+            h, p = target.rsplit(":", 1)
+            HOST = h
+            PORT = int(p)
+        else:
+            HOST = target
+    if len(sys.argv) >= 3:
+        PORT = int(sys.argv[2])
+
+    print(f"target {HOST}:{PORT}")
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            flag, reason = one_attempt(verbose=False)
+            if flag:
+                print(flag)
+                return
+            print(f"attempt {attempt}: {reason}")
+        except (socket.timeout, ConnectionError, OSError, ValueError, ZeroDivisionError) as ex:
+            print(f"attempt {attempt}: {type(ex).__name__}")
+
+
+if __name__ == '__main__':
+    main()
+```
+
+## Final Thoughts
+
+This was a strong crypto challenge because it forced a full exploit chain rather than one isolated trick. Recovering `x` alone was not enough. You still had to understand the custom hash, the size of `e`, the length guard, and the final forgery condition. Once those pieces lined up, the solve became very clean.

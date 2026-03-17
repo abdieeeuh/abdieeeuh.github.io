@@ -1,0 +1,59 @@
+---
+import BlogCard from '@/components/blog-card.astro'
+import Breadcrumbs from '@/components/breadcrumbs.astro'
+import PageHead from '@/components/page-head.astro'
+import Layout from '@/layouts/layout.astro'
+import { getAllCategories, getPostsByCategory } from '@/lib/data-utils'
+import { formatLabel } from '@/lib/utils'
+
+export async function getStaticPaths() {
+  const categoryMap = await getAllCategories()
+  const uniqueCategories = Array.from(categoryMap.keys())
+
+  return Promise.all(
+    uniqueCategories.map(async (category) => {
+      const posts = await getPostsByCategory(category)
+      return {
+        params: { id: category },
+        props: {
+          category,
+          posts,
+        },
+      }
+    }),
+  )
+}
+
+const { category, posts } = Astro.props
+---
+
+<Layout class="max-w-3xl">
+  <PageHead
+    slot="head"
+    title={`${formatLabel(category)} posts`}
+    description={`Posts filed under ${formatLabel(category)}.`}
+    noindex
+  />
+  <Breadcrumbs
+    items={[
+      { href: '/categories', label: 'Categories', icon: 'lucide:folders' },
+      { label: formatLabel(category), icon: 'lucide:folder-open' },
+    ]}
+  />
+
+  <ul class="flex flex-col gap-y-4">
+    {
+      posts.length > 0 ? (
+        posts.map((post) => (
+          <li>
+            <BlogCard entry={post} />
+          </li>
+        ))
+      ) : (
+        <li class="text-muted-foreground rounded-lg border border-dashed p-6 text-sm">
+          No posts in this event yet.
+        </li>
+      )
+    }
+  </ul>
+</Layout>

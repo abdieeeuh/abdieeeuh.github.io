@@ -1,0 +1,33 @@
+---
+import Breadcrumbs from '@/components/breadcrumbs.astro'
+import Link from '@/components/link.astro'
+import PageHead from '@/components/page-head.astro'
+import Layout from '@/layouts/layout.astro'
+import { getSortedCategories } from '@/lib/data-utils'
+import { formatLabel } from '@/lib/utils'
+
+const sortedCategories = await getSortedCategories()
+---
+
+<Layout class="max-w-3xl">
+  <PageHead slot="head" title="Categories" />
+  <Breadcrumbs items={[{ label: 'Categories', icon: 'lucide:folders' }]} />
+
+  <ul class="grid gap-3 sm:grid-cols-2">
+    {
+      sortedCategories.map(({ category, count }) => (
+        <li>
+          <Link
+            href={`/categories/${category}`}
+            class="hover:bg-muted/40 flex items-center justify-between rounded-md border p-4 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md"
+          >
+            <span class="font-medium">{formatLabel(category)}</span>
+            <span class="bg-muted text-muted-foreground rounded-full px-2 py-0.5 text-xs">
+              {count}
+            </span>
+          </Link>
+        </li>
+      ))
+    }
+  </ul>
+</Layout>

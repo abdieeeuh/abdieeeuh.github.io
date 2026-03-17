@@ -1,0 +1,117 @@
+---
+import AvatarComponent from '@/components/ui/avatar'
+import { badgeVariants, Badge } from '@/components/ui/badge'
+import { Separator } from '@/components/ui/separator'
+import {
+  getCombinedReadingTime,
+  getSubpostCount,
+  isSubpost,
+  parseAuthors,
+} from '@/lib/data-utils'
+import { formatDate, formatLabel } from '@/lib/utils'
+import { Icon } from 'astro-icon/components'
+import { Image } from 'astro:assets'
+import type { CollectionEntry } from 'astro:content'
+import Link from './link.astro'
+
+interface Props {
+  entry: CollectionEntry<'blog'>
+}
+
+const { entry } = Astro.props
+const formattedDate = formatDate(entry.data.date)
+const readTime = await getCombinedReadingTime(entry.id)
+const authors = await parseAuthors(entry.data.authors ?? [])
+const subpostCount = !isSubpost(entry.id) ? await getSubpostCount(entry.id) : 0
+---
+
+<div
+  class="group hover:bg-muted/50 rounded-xl border p-4 transition-colors duration-300 ease-in-out"
+>
+  <div class="flex flex-col gap-4 sm:flex-row">
+    {
+      entry.data.image && (
+        <Link
+          href={`/blog/${entry.id}`}
+          class="w-full overflow-hidden rounded-lg sm:max-w-3xs sm:shrink-0"
+        >
+          <Image
+            src={entry.data.image}
+            alt={entry.data.title}
+            width={1200}
+            height={630}
+            class="object-cover transition-transform duration-300 group-hover:scale-[1.02]"
+          />
+        </Link>
+      )
+    }
+
+    <div class="grow">
+      <h3 class="mb-1 text-lg font-medium">
+        <Link
+          href={`/blog/${entry.id}`}
+          class="hover:text-foreground/80"
+        >
+          {entry.data.title}
+        </Link>
+      </h3>
+      <p class="text-muted-foreground mb-2 text-sm">{entry.data.description}</p>
+
+      <div
+        class="text-muted-foreground mb-2 flex flex-wrap items-center gap-x-2 text-xs"
+      >
+        {
+          authors.length > 0 && (
+            <>
+              {authors.map((author) => (
+                <div class="flex items-center gap-x-1.5">
+                  <AvatarComponent
+                    client:load
+                    src={author.avatar}
+                    alt={author.name}
+                    fallback={author.name[0]}
+                    className="size-5 rounded-full"
+                  />
+                  <span>{author.name}</span>
+                </div>
+              ))}
+              <Separator orientation="vertical" className="h-4!" />
+            </>
+          )
+        }
+        <span>{formattedDate}</span>
+        <Separator orientation="vertical" className="h-4!" />
+        <span>{readTime}</span>
+        {
+          subpostCount > 0 && (
+            <>
+              <Separator orientation="vertical" className="h-4!" />
+              <span class="flex items-center gap-1">
+                <Icon name="lucide:file-text" class="size-3" />
+                {subpostCount} subpost{subpostCount === 1 ? '' : 's'}
+              </span>
+            </>
+          )
+        }
+      </div>
+
+      <div class="flex flex-wrap gap-2">
+        <Link
+          href={`/categories/${entry.data.category}`}
+          class={badgeVariants({ variant: 'muted' })}
+        >
+          <Icon name="lucide:folder-open" class="size-3" />
+          {formatLabel(entry.data.category)}
+        </Link>
+        {
+          entry.data.discipline && (
+            <Badge variant="muted" className="flex items-center gap-x-1">
+              <Icon name="lucide:shield-ellipsis" class="size-3" />
+              {formatLabel(entry.data.discipline)}
+            </Badge>
+          )
+        }
+      </div>
+    </div>
+  </div>
+</div>

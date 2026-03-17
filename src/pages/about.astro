@@ -1,0 +1,16 @@
+---
+import Breadcrumbs from '@/components/breadcrumbs.astro'
+import PageHead from '@/components/page-head.astro'
+import Layout from '@/layouts/layout.astro'
+---
+
+<Layout class="max-w-3xl">
+  <PageHead slot="head" title="About" />
+  <Breadcrumbs items={[{ label: 'About', icon: 'lucide:info' }]} />
+
+  <section class="flex min-h-[40vh] items-center justify-center">
+    <p class="text-center font-mono text-lg font-semibold tracking-[0.24em] uppercase text-foreground/80 sm:text-xl">
+      THE LESS YOU KNOW THE BETTER
+    </p>
+  </section>
+</Layout>
