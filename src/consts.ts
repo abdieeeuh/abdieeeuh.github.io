@@ -4,7 +4,7 @@ export const SITE: Site = {
   title: 'Abdieeuh',
   description:
     'I keep documentation of completed challenges here',
-  href: 'https://abdieeuh.github.io',
+  href: 'https://abdieeeuh.github.io',
   author: 'Abdieeuh',
   locale: 'en-US',
   featuredPostCount: 2,
