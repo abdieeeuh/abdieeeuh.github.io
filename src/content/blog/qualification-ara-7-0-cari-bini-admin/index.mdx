@@ -75,14 +75,6 @@ curl -i -b cookies.txt -X POST http://challenge.ara-its.id:3333/myaccount/bot \
   --data-urlencode "path=https://google.com"
 ```
 
-If source code had not been provided, a quick content discovery pass would still have been reasonable:
-
-```bash
-ffuf -u http://challenge.ara-its.id:3333/FUZZ \
-  -w /usr/share/seclists/Discovery/Web-Content/common.txt \
-  -fc 404
-```
-
 The important findings from enumeration were:
 
 - `/myaccount` returned profile data for the current session
