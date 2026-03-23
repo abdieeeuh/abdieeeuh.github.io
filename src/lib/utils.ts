@@ -5,6 +5,7 @@ const LABEL_OVERRIDES: Record<string, string> = {
   'web-exploitation': 'Web Exploitation',
   'qualification-ara-7-0': 'Qualification ARA 7.0',
   'final-ara-7-0': 'Final ARA 7.0',
+  'texas-am-university-2026': 'Texas A&M University 2026',
   misc: 'Misc',
   'reverse-engineering': 'Reverse Engineering',
   'binary-exploitation': 'Binary Exploitation',

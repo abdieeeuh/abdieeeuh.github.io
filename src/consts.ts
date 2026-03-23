@@ -42,4 +42,8 @@ export const ICON_MAP: IconMap = {
   RSS: 'lucide:rss',
 }
 
-export const EVENT_CATEGORIES = ['qualification-ara-7-0', 'final-ara-7-0']
+export const EVENT_CATEGORIES = [
+  'qualification-ara-7-0',
+  'final-ara-7-0',
+  'texas-am-university-2026',
+]

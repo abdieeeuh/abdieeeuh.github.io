@@ -1,0 +1,603 @@
+---
+title: 'Texas A&M University 2026 - Kitchen Sink'
+description: 'Decoy-string ELF with anti-debug self-attach checks, a string-decoding VM, and a 64-point Walsh-Hadamard transform that can be inverted directly from the embedded target.'
+date: 2026-03-21
+category: 'texas-am-university-2026'
+discipline: 'reverse-engineering'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: I solved this challenge with LLM
+
+# kitchen-sink
+
+## Intro
+
+The challenge description already hints at what the binary is going to do:
+
+> sometimes you just have to throw the whole kitchen sink at them  
+> maybe this way it won't get slopped
+
+That is exactly what the ELF does. It throws a lot of unrelated-looking material at you:
+
+1. fake flags in `strings`
+2. anti-debug checks with `fork` and `ptrace`
+3. runtime string decoding
+4. a huge dispatcher instead of small readable helpers
+5. a tiny VM that looks like a side-quest
+
+The good news is that the actual verification logic is much cleaner than the surrounding noise.
+
+The real solve path ended up being:
+
+1. unpack the tarball and ignore the bait strings
+2. understand why the binary always says `nop!` under tracing in this environment
+3. recover the input transform from the big dispatcher
+4. recognize that the transform is a 64-point Walsh-Hadamard matrix
+5. invert it directly from the embedded target table
+
+## Recon: What Is in the Distribution?
+
+The challenge ships as a tarball containing one ELF:
+
+```bash
+$ ls -la
+total 20
+drwxr-xr-x 2 root root  4096 Mar 21 22:31 .
+drwxr-xr-x 7 root root  4096 Mar 21 22:30 ..
+-rw-r--r-- 1 root root 10897 Mar 21 22:11 kitchen-sink.tar.gz
+
+$ tar -tzf kitchen-sink.tar.gz
+kitchen-sink/
+kitchen-sink/kitchen-sink
+```
+
+Basic properties:
+
+```bash
+$ file kitchen-sink/kitchen-sink
+kitchen-sink/kitchen-sink: ELF 64-bit LSB pie executable, x86-64, dynamically linked, stripped
+
+$ checksec --file=kitchen-sink/kitchen-sink
+[*] '/home/abdieeuh/gigem/rev/5/kitchen-sink/kitchen-sink'
+    Arch:       amd64-64-little
+    RELRO:      Partial RELRO
+    Stack:      No canary found
+    NX:         NX enabled
+    PIE:        PIE enabled
+```
+
+The import set already suggests anti-analysis behavior:
+
+```bash
+$ strings -a -n 4 kitchen-sink/kitchen-sink | sed -n '1,40p'
+/lib64/ld-linux-x86-64.so.2
+fgets
+snprintf
+stdin
+puts
+clock_gettime
+fflush
+fopen
+fork
+getppid
+strstr
+ptrace
+stdout
+_exit
+strcspn
+...
+```
+
+And the obvious string pass is full of bait:
+
+```bash
+$ strings -a -n 4 kitchen-sink/kitchen-sink | sed -n '40,80p'
+LAG{d3c0y_fl4g}
+flag{keep_running_strings_on_this}
+flag is hidden @ https://tinyurl.com/t7aczm46
+KEY=base64(ZmxhZ3tub3BlX3N0aWxsX3dyb25nfQ==)
+```
+
+All of those are fake:
+
+- the first one does not even match the expected `gigem{...}` format
+- the second and third are obvious decoys
+- the base64 decodes to another fake flag
+
+So `strings` is useful only as a warning that the challenge wants to waste time.
+
+## Experiment Log
+
+I am including the false starts and partial experiments on purpose, because that was part of the solve process.
+
+### 1. Run the binary directly
+
+First run:
+
+```bash
+$ ./kitchen-sink/kitchen-sink
+flag>
+```
+
+With sample input:
+
+```bash
+$ printf 'test\n' | ./kitchen-sink/kitchen-sink
+flag> nop!
+```
+
+So the program is simple on the surface:
+
+- print `flag> `
+- read one line
+- either accept or print `nop!`
+
+### 2. Try the obvious strings route
+
+This fails immediately.
+
+The binary contains all of these:
+
+```text
+LAG{d3c0y_fl4g}
+flag{keep_running_strings_on_this}
+flag is hidden @ https://tinyurl.com/t7aczm46
+KEY=base64(ZmxhZ3tub3BlX3N0aWxsX3dyb25nfQ==)
+```
+
+None of them are the real answer.
+
+This was still worth doing because it established that the challenge is intentionally hostile to shallow triage.
+
+### 3. Trace it with `strace`
+
+This is the first experiment that looked noisy but actually mattered.
+
+```bash
+$ strace -f -o /tmp/ks.strace sh -c "printf 'test\n' | ./kitchen-sink/kitchen-sink"
+flag> nop!
+```
+
+Important excerpt:
+
+```text
+3944  clone(...)                                  = 3945
+3945  getppid()                                   = 3944
+3945  ptrace(PTRACE_ATTACH, 3944)                 = -1 EPERM (Operation not permitted)
+3945  exit_group(1)                               = ?
+3944  wait4(3945, [{WIFEXITED(s) && WEXITSTATUS(s) == 1}], 0, NULL) = 3945
+3944  read(0, "test\n", 4096)                     = 5
+3944  clone(...)                                  = 3951
+3951  getppid()                                   = 3944
+3951  ptrace(PTRACE_ATTACH, 3944)                 = -1 EPERM (Operation not permitted)
+3951  exit_group(1)                               = ?
+3944  wait4(3951, [{WIFEXITED(s) && WEXITSTATUS(s) == 1}], 0, NULL) = 3951
+3944  write(1, "nop!\n", 5)                       = 5
+```
+
+This told me two important things:
+
+1. the process is forking a child just to `ptrace` the parent
+2. in this environment, that check fails with `EPERM`, so dynamic validation through the original binary is not trustworthy
+
+That did not give the flag, but it explained why runtime testing kept ending in `nop!`.
+
+### 4. Try `ltrace`
+
+This mostly produced noise:
+
+```bash
+$ ltrace -f -o /tmp/ks.ltrace sh -c "printf 'test\n' | ./kitchen-sink/kitchen-sink"
+flag> nop!
+```
+
+The output was full of libc churn and not especially helpful beyond confirming that the program was doing environment checks and a lot of setup before the real comparison.
+
+This was a partial dead end.
+
+### 5. Try rizin decompilation
+
+Rizin was useful for function discovery:
+
+```bash
+$ rizin -Aqc 'afl' kitchen-sink/kitchen-sink
+0x00004b30    1 45           main
+0x00004d00    1 65           fcn.00004d00
+0x00004d50  133 3983         fcn.00004d50
+```
+
+`main` is tiny and forwards everything to the big helper:
+
+```bash
+$ rizin -Aqc 's main; pdf' kitchen-sink/kitchen-sink
+┌  int main(int argc, char **argv, char **envp);
+│  0x00004b44      mov edi, 4
+│  0x00004b49      call fcn.00004d50
+│  0x00004b4e      mov eax, dword [var_4h]
+└  0x00004b5c      ret
+```
+
+I then tried to use radare2's decompiler:
+
+```bash
+$ r2 -Aqc 's 0x4d50; pdd' kitchen-sink/kitchen-sink
+ERROR: Missing plugin. Run: r2pm -ci r2dec
+```
+
+So that specific path failed. `pdf` and raw disassembly were still useful, but not enough on their own for the whole function.
+
+### 6. Try Ghidra headless with Python
+
+The first version of the dump script was written in Python, and that failed too:
+
+```text
+ERROR REPORT SCRIPT ERROR: ghidra_dump_all.py : Ghidra was not started with PyGhidra. Python is not available
+```
+
+So I rewrote the script as a Java Ghidra script and ran headless analysis again.
+
+That worked and finally produced a decompilation dump I could reason from.
+
+This was the turning point.
+
+## Main Control Flow
+
+The binary uses one giant dispatcher, `FUN_00104d50`, for almost everything.
+
+`main()` just calls it with selector `4`:
+
+```c
+int main(int argc, char **argv, char **envp) {
+    int rc;
+    FUN_00104d50(4, argc, argv, &rc);
+    return rc;
+}
+```
+
+There are also init routines that call the same helper with selectors `0`, `1`, and `2`.
+
+So instead of a normal call graph, the program hides all meaningful behavior behind a switch-like dispatcher.
+
+## What the Big Dispatcher Actually Does
+
+The relevant cases are:
+
+- case `0`: hash the first `0x5ce8` bytes of the mapped image and derive two globals
+- case `1`: seed `rand()`
+- case `2`: touch `alarm()`
+- case `4`: main verifier
+- case `6`: build the transformed 64-word vector from the user input
+- case `7`: reduce two vectors into one equality accumulator
+- case `8`: `fork` + `ptrace` self-check
+- case `9`: compute rows of a signed transform
+- case `0xa`: compute a single transform coefficient
+- case `0xb`: popcount helper
+- case `0xc` / `0xd`: execute a tiny VM over the bytecode blob in `.rodata`
+
+That is the "kitchen sink" part of the challenge: almost every helper is buried inside the same dispatcher.
+
+## The Tiny VM: Mostly There to Decode Strings
+
+One of the weirdest parts of the binary is the call to `FUN_00104d00(&DAT_00106230, 0x84)`.
+
+The blob at `.rodata:0x6230` is not a flag. It is bytecode for a small interpreter implemented in case `0xd`.
+
+```bash
+$ readelf -x .rodata kitchen-sink/kitchen-sink | sed -n '35,46p'
+  0x00006210 894c4147 7b643363 30795f66 6c34677d .LAG{d3c0y_fl4g}
+  0x00006220 00000000 00000000 00000000 00000000 ................
+  0x00006230 130181ff 93020000 13030100 23305300 ............#0S.
+  0x00006240 6f004000 93020100 03b30200 b322c300 o.@.........."..
+  0x00006250 6344c300 6f004005 13030100 83320300 cD..o.@......2..
+  0x00006260 b3e3d202 b3817500 83830100 b3015500 ......u.......U.
+  ...
+```
+
+The interpreter looks very close to a reduced RISC-V-style VM:
+
+- fixed 32-bit instructions
+- load/store
+- register-register arithmetic
+- register-immediate arithmetic
+- branches and jumps
+
+I did not need to fully reverse the VM instruction set to solve the challenge, because the decompilation made its role clear:
+
+- it is used heavily in the early part of case `4`
+- it decodes a pile of runtime strings and constants
+- it is not the final math used to validate the flag
+
+That explains why the stack locals in the verifier start life as nonsense bytes and only become meaningful strings after a lot of indirect helper calls.
+
+## Anti-Debug: Why the Original Binary Keeps Saying `nop!`
+
+The `ptrace` child check appears twice:
+
+1. before reading the input
+2. again after reading the input
+
+The logic is:
+
+```c
+pid = fork();
+if (pid == 0) {
+    p = getppid();
+    if (ptrace(PTRACE_ATTACH, p, 0, 0) == -1) _exit(1);
+    waitpid(p, 0, 0);
+    ptrace(PTRACE_DETACH, p, 0, 0);
+    _exit(0);
+}
+waitpid(pid, &status, 0);
+return WEXITSTATUS(status);
+```
+
+If the attach fails, the binary sets a global failure marker:
+
+```c
+DAT_00108368 = 0xdead;
+```
+
+Later, even if the input transform is correct, that poisoned global prevents success.
+
+So in this environment:
+
+- static recovery is reliable
+- dynamic success/failure through the original ELF is not
+
+## The Real Verification Logic
+
+Once the anti-debug and string-decoding noise is stripped away, the verifier is much simpler.
+
+The critical constant is the 64-word target vector stored at `.rodata:0x6010`:
+
+```bash
+$ readelf -x .rodata kitchen-sink/kitchen-sink | sed -n '1,10p'
+Hex dump of section '.rodata':
+  0x00006000 01000200 00000000 00000000 00000000 ................
+  0x00006010 7912a700 adfe8300 e70175fe 67ff2500 y.........u.g.%.
+  0x00006020 ff00adff cf00fdfe a50013ff 69febf00 ............i...
+  0x00006030 b3048900 07006dff b5fec300 edff1300 ......m.........
+  ...
+```
+
+Interpreted as little-endian signed 16-bit integers, that is the target output of the transform.
+
+The interesting helpers are cases `9`, `0xa`, and `0xb`.
+
+### case `0xb`: popcount
+
+This one is easy to recognize:
+
+```c
+x = x - ((x >> 1) & 0x55555555);
+y = (x & 0x33333333) + ((x >> 2) & 0x33333333);
+return ((y + (y >> 4)) & 0x0f0f0f0f) * 0x01010101 >> 24;
+```
+
+That is just a standard population-count routine.
+
+### case `0xa`: map popcount parity to `+1` or `-1`
+
+The input to case `0xa` is:
+
+```c
+(param_18 ^ 0xffffffff | param_17 ^ 0xffffffff) ^ 0xffffffff
+```
+
+By DeMorgan's law that reduces to:
+
+```c
+param_17 & param_18
+```
+
+Then case `0xb` is applied to that value, and the result is turned into:
+
+- `+1` if the popcount is even
+- `-1` if the popcount is odd
+
+So case `0xa` computes:
+
+```c
+sign(i, j) = (-1) ^ popcount(i & j)
+```
+
+### case `9`: dot product over 64 bytes
+
+Case `9` loops over rows and columns and accumulates:
+
+```c
+out[i] += sign(i, j) * input[j];
+```
+
+for `j = 0..63`.
+
+That is a 64-point Walsh-Hadamard transform with matrix:
+
+```text
+H[i, j] = (-1)^(popcount(i & j))
+```
+
+This is the main insight of the challenge.
+
+## Why the Solve Becomes Deterministic
+
+Let:
+
+- `x` be the 64-byte input buffer
+- `y` be the 64 signed 16-bit words stored in `.rodata:0x6010`
+- `H` be the 64x64 Hadamard matrix described above
+
+Then the verifier is checking:
+
+```text
+y = H * x
+```
+
+Because the flag is only 52 bytes long, the remaining 12 bytes of the 64-byte buffer are just `\0`.
+
+The crucial property is:
+
+```text
+H * H = 64 * I
+```
+
+So the inverse is immediate:
+
+```text
+x = (H * y) / 64
+```
+
+That means there is no brute force at all. Once the target vector is extracted, the input bytes can be recovered directly.
+
+## Minimal Solver
+
+I archived the solver I used for this challenge.
+
+The full script is:
+
+```python
+#!/usr/bin/env python3
+import struct
+import sys
+from pathlib import Path
+
+
+def read_rodata(binary: bytes) -> bytes:
+    if binary[:4] != b"\x7fELF" or binary[4] != 2 or binary[5] != 1:
+        raise ValueError("expected a 64-bit little-endian ELF")
+
+    e_shoff = struct.unpack_from("<Q", binary, 0x28)[0]
+    e_shentsize = struct.unpack_from("<H", binary, 0x3A)[0]
+    e_shnum = struct.unpack_from("<H", binary, 0x3C)[0]
+    e_shstrndx = struct.unpack_from("<H", binary, 0x3E)[0]
+
+    shstr_off = struct.unpack_from("<Q", binary, e_shoff + e_shstrndx * e_shentsize + 0x18)[0]
+    shstr_size = struct.unpack_from("<Q", binary, e_shoff + e_shstrndx * e_shentsize + 0x20)[0]
+    shstr = binary[shstr_off : shstr_off + shstr_size]
+
+    for idx in range(e_shnum):
+        sh = e_shoff + idx * e_shentsize
+        name_off = struct.unpack_from("<I", binary, sh)[0]
+        sec_off = struct.unpack_from("<Q", binary, sh + 0x18)[0]
+        sec_size = struct.unpack_from("<Q", binary, sh + 0x20)[0]
+        end = shstr.find(b"\x00", name_off)
+        name = shstr[name_off:end]
+        if name == b".rodata":
+            return binary[sec_off : sec_off + sec_size]
+
+    raise ValueError("missing .rodata")
+
+
+def hadamard_sign(i: int, j: int) -> int:
+    return -1 if ((i & j).bit_count() & 1) else 1
+
+
+def inverse_hadamard(target):
+    out = []
+    for col in range(64):
+        acc = 0
+        for row, value in enumerate(target):
+            acc += hadamard_sign(row, col) * value
+        if acc % 64 != 0:
+            raise ValueError(f"non-integral inverse coefficient at column {col}: {acc}/64")
+        out.append(acc // 64)
+    return out
+
+
+def forward_hadamard(buf):
+    return [
+        sum(hadamard_sign(row, col) * buf[col] for col in range(64))
+        for row in range(64)
+    ]
+
+
+def main() -> int:
+    path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("kitchen-sink/kitchen-sink")
+    binary = path.read_bytes()
+    rodata = read_rodata(binary)
+
+    target = list(struct.unpack_from("<64h", rodata, 0x10))
+    recovered = inverse_hadamard(target)
+    recovered_bytes = bytes(v & 0xFF for v in recovered)
+    flag = recovered_bytes.split(b"\x00", 1)[0].decode("ascii")
+
+    if forward_hadamard(recovered) != target:
+        raise ValueError("forward transform check failed")
+    if not flag.startswith("gigem{") or not flag.endswith("}"):
+        raise ValueError(f"unexpected flag format: {flag!r}")
+
+    print(flag)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+Running it:
+
+```bash
+$ python3 solve.py
+gigem{h0pefu11Y_This_0n3_last5_m0Re_thaN_4n_h0ur...}
+```
+
+And the extra forward check confirms that the reconstructed bytes produce the exact embedded target vector.
+
+## Pseudocode Summary
+
+A much simpler view of the verifier is:
+
+```c
+bool verify(const char *s) {
+    if (anti_debug_failed()) {
+        return false;
+    }
+
+    uint8_t buf[64] = {0};
+    copy_input_line(buf, s);   // fgets-style, so unused tail stays zero
+
+    int16_t got[64];
+    int16_t want[64] = TARGET_FROM_RODATA;
+
+    for (int i = 0; i < 64; i++) {
+        int acc = 0;
+        for (int j = 0; j < 64; j++) {
+            int sign = ((popcount(i & j) & 1) == 0) ? 1 : -1;
+            acc += sign * buf[j];
+        }
+        got[i] = (int16_t)acc;
+    }
+
+    return memcmp(got, want, sizeof(got)) == 0;
+}
+```
+
+The string-decoding VM and self-hash logic are real, but they are not the part that makes the flag recoverable.
+
+## Flag
+
+```text
+gigem{h0pefu11Y_This_0n3_last5_m0Re_thaN_4n_h0ur...}
+```
+
+## Closing
+
+The challenge looks much messier than it really is.
+
+The fake flags, the `ptrace` check, the string-decoding VM, and the giant dispatcher are all there to increase the cost of getting to the core logic. But the actual validator is just:
+
+- a 64-byte input buffer
+- a 64-point Walsh-Hadamard transform
+- a comparison against a static target vector
+
+Once that structure is recognized, the solve is fully deterministic.
+
+## References
+
+- [Rizin](https://rizin.re/)
+- [Radare2 Book](https://book.rada.re/)
+- [Ghidra](https://ghidra-sre.org/)
+- [ELF format overview](https://refspecs.linuxfoundation.org/elf/elf.pdf)
+- [Hadamard matrix](https://en.wikipedia.org/wiki/Hadamard_matrix)

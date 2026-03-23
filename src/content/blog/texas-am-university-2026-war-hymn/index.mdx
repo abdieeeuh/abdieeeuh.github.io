@@ -1,0 +1,656 @@
+---
+title: 'Texas A&M University 2026 - War Hymn'
+description: 'Layered anti-debug Linux ELF, hymn-derived rolling XOR, staged shared object extraction, and RC4 recovery of the final flag.'
+date: 2026-03-21
+category: 'texas-am-university-2026'
+discipline: 'reverse-engineering'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: I solved this challenge with LLM
+
+# War Hymn
+
+## Intro
+
+This challenge looks like a normal stripped Linux ELF at first, but it is really a wrapper around a second-stage shared object.
+
+The wrapper mixes together several layers:
+
+1. anti-debug checks through `TracerPid`
+2. a fake or blocking network path
+3. hymn-based string decoding
+4. a custom rolling decoder for a hidden payload
+5. a staged shared object that runs its own anti-debug logic
+6. a final RC4-style decryption step that yields the flag
+
+The clean solve path was:
+
+1. unpack the archive
+2. inspect the wrapper ELF
+3. confirm the anti-debug behavior
+4. statically recover the staged payload
+5. analyze the second stage
+6. decrypt the final blob
+
+## Recon: What Is in the Distribution?
+
+The handout is a tarball containing a single binary.
+
+```bash
+$ ls -lah
+total 20K
+drwxr-xr-x 2 root root 4.0K Mar 21 22:12 .
+drwxr-xr-x 6 root root 4.0K Mar 21 22:11 ..
+-rw-r--r-- 1 root root 9.1K Mar 19 02:57 war-hymn.tar.gz
+
+$ tar -tzf war-hymn.tar.gz
+war-hymn
+```
+
+After extraction:
+
+```bash
+$ ls -lah
+total 52K
+drwxr-xr-x 2 root root     4.0K Mar 21 22:13 .
+drwxr-xr-x 6 root root     4.0K Mar 21 22:11 ..
+-rwxr-xr-x 1 1001 abdieeuh  30K Mar 18 22:45 war-hymn
+-rw-r--r-- 1 root root     9.1K Mar 19 02:57 war-hymn.tar.gz
+```
+
+Basic file information:
+
+```bash
+$ file war-hymn
+war-hymn: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=db7ab7c34b17b91aa3d466ccd7d3127a018c2e11, for GNU/Linux 3.2.0, stripped
+
+$ checksec --file=war-hymn
+[*] '/home/abdieeuh/gigem/rev/4/war-hymn'
+    Arch:       amd64-64-little
+    RELRO:      Partial RELRO
+    Stack:      Canary found
+    NX:         NX enabled
+    PIE:        No PIE (0x400000)
+    FORTIFY:    Enabled
+    SHSTK:      Enabled
+    IBT:        Enabled
+```
+
+One immediately suspicious detail is the pair of extra sections:
+
+```bash
+$ readelf -S war-hymn
+[29] .init.checksum.validation PROGBITS ...
+[30] .bss.secure.buffer        PROGBITS ...
+```
+
+Those names are not normal compiler output and end up mattering a lot.
+
+## Initial Strings and Surface Clues
+
+A quick string pass gives away the broad themes:
+
+```bash
+$ strings -a -n 4 war-hymn | head -n 80
+/proc/self/status
+TracerPid:
+LD_PRELOAD
+142.250.190.78
+1.2.11
+Error: %d
+Error
+%s/%d
+Error: %s
+Hullabaloo, Caneck! Caneck! Hullabaloo, Caneck! Caneck! All hail to dear old Texas A&M ...
+```
+
+From this alone, a few hypotheses were already reasonable:
+
+- it checks `/proc/self/status`
+- it sabotages traced execution
+- it may talk to the network
+- it probably uses the Aggie War Hymn text as key material
+- zlib is involved somehow because of `inflate*`
+- `memfd_create`, `dlopen`, and `dlsym` strongly suggest runtime-loaded code
+
+## Experiment Log
+
+This section is intentionally chronological, including dead ends and failed experiments.
+
+### Experiment 1: Just run the binary
+
+First attempt:
+
+```bash
+$ timeout 2s ./war-hymn; echo EXIT:$?
+EXIT:124
+```
+
+It did not print anything and just hung. That suggested one of:
+
+- blocking network activity
+- waiting on a spawned thread
+- waiting on hidden input
+- a staged loader that never reaches its payload
+
+### Experiment 2: `strace` the binary
+
+This failed, but it was a useful failure.
+
+```bash
+$ strace -f -o strace.log -s 200 timeout 3s ./war-hymn || true
+```
+
+The important part of the trace:
+
+```text
+openat(AT_FDCWD, "/proc/self/status", O_RDONLY) = 3
+read(3, "Name:\twar-hymn\n...TracerPid:\t1483\n...", 1024) = 1024
+...
+--- SIGSEGV {si_signo=SIGSEGV, si_code=SI_KERNEL, si_addr=NULL} ---
++++ killed by SIGSEGV +++
+```
+
+So under tracing, the program reads `TracerPid`, notices the tracer, and intentionally crashes.
+
+This meant dynamic tracing on the wrapper was the wrong first move.
+
+### Experiment 3: Force `LD_PRELOAD`
+
+Because the binary explicitly references `LD_PRELOAD`, I tried flipping that condition manually.
+
+```bash
+$ env LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libc.so.6 ./war-hymn; echo EXIT:$?
+EXIT:139
+```
+
+That also crashed, which told me the `LD_PRELOAD` branch is not a bypass. It is a sabotage path or an alternate decoding path meant to poison analysis.
+
+So this was a dead end for solving, but it clarified that the wrapper's environment checks are not intended as honest runtime configuration.
+
+### Experiment 4: Attach after startup instead of tracing from launch
+
+Launching normally and attaching later worked much better.
+
+```bash
+$ ./war-hymn >/tmp/wh.out 2>/tmp/wh.err & echo $! > /tmp/wh.pid
+$ sleep 2
+$ ps -p $(cat /tmp/wh.pid) -o pid,stat,cmd
+    PID STAT CMD
+   1964 SNl  ./war-hymn
+```
+
+Then attach:
+
+```bash
+$ gdb -q -p $(cat /tmp/wh.pid)
+```
+
+The useful part of the backtrace:
+
+```text
+Thread 2:
+#3  __libc_connect
+#4  0x0000000000401b5f in ?? ()
+
+Thread 1:
+#5  __pthread_clockjoin_ex
+#6  0x0000000000402344 in ?? ()
+#7  0x0000000000401549 in ?? ()
+```
+
+This showed:
+
+- one thread is blocked in `connect`
+- the main thread is blocked in `pthread_join`
+
+So the wrapper hangs because a helper thread is trying to connect out, and the main thread is waiting for it to finish.
+
+That confirmed the blocking-network theory.
+
+### Experiment 5: Partial string decoding from `main`
+
+At this stage I started decoding the small obfuscated constants built on the stack in `main`.
+
+That worked for several strings:
+
+- `/proc/self/exe`
+- `.init.checksum.validation`
+- `.bss.secure.buffer`
+- `.init.constructors.global`
+- `/proc/self/fd`
+
+But one candidate decoded into garbage:
+
+```text
+those_whO\x81!\xea\x05-
+```
+
+That was a useful partial failure. It meant I was seeing a first layer of decoding, but not the final plaintext yet. That blob turned out to be part of a later RC4-protected payload.
+
+## Wrapper Structure
+
+`main` is mostly a dispatcher. It does three interesting things:
+
+1. decodes strings using bytes from the Aggie War Hymn
+2. starts a helper thread with the function at `0x401ab0`
+3. extracts and loads another payload through a chain of helper functions
+
+Function map from `rizin`:
+
+```bash
+$ rizin -q -c 'aaa; afl' war-hymn
+0x004014b0   38 1073 -> 1064 main
+0x004019e0   11 197  -> 193  fcn.004019e0
+0x00401d50    3 49   -> 42   fcn.00401d50
+0x00401d90   16 497  -> 482  fcn.00401d90
+0x00401f90   16 347  -> 329  fcn.00401f90
+0x004020f0   13 360  -> 350  fcn.004020f0
+0x00402260    9 245  -> 239  fcn.00402260
+```
+
+The key helpers are:
+
+- `0x4019e0`: `TracerPid` anti-debug
+- `0x401d90`: extract a named blob from `/proc/self/exe`
+- `0x401f90`: zlib decompression helper
+- `0x4020f0`: load decompressed stage into a memfd and `dlopen` it
+- `0x402260`: blocking network helper that spawns the connection thread
+
+## Anti-Debug in the Wrapper
+
+The wrapper anti-debug function is clean and direct:
+
+```asm
+0x4019e0  fopen("/proc/self/status", "r")
+0x401a28  fgets(...)
+0x401a3d  cmp QWORD PTR [rsp], "TracerPi"
+0x401a4c  strtol(line + 10, 0, 10)
+0x401a6a  test ebx, ebx
+0x401a6c  setne al
+```
+
+So the logic is effectively:
+
+```c
+bool traced(void) {
+  open("/proc/self/status");
+  find line starting with "TracerPid:";
+  return atoi(value) != 0;
+}
+```
+
+The wrapper consults this in multiple places. When tracing is detected, it mutates key bytes or takes poisoned branches.
+
+## Small String Decoder in `main`
+
+The wrapper uses the hymn bytes in `.data` as a small keystream for local strings.
+
+The decryption pattern is:
+
+```c
+decoded[i] = encoded[i] ^ (hymn[i + 8] + 0x15);
+```
+
+That is enough to recover the internal path names that matter:
+
+```text
+/proc/self/exe
+.init.checksum.validation
+.bss.secure.buffer
+.init.constructors.global
+/proc/self/fd
+```
+
+Those names point directly at the actual staged loader logic:
+
+- read your own file through `/proc/self/exe`
+- extract named custom sections
+- run a decoder from `.init.checksum.validation`
+- apply it to `.bss.secure.buffer`
+
+## The Hidden Decoder in `.init.checksum.validation`
+
+The wrapper contains a tiny executable blob in the nonstandard section `.init.checksum.validation`.
+
+Dumping it and disassembling it as raw x86-64:
+
+```bash
+$ dd if=war-hymn bs=1 skip=$((0x5000)) count=$((0x47)) status=none of=/tmp/init_checksum.bin
+$ objdump -D -b binary -m i386:x86-64 /tmp/init_checksum.bin
+```
+
+The decoder reduces to:
+
+```c
+void decode(uint8_t *src, int n, uint8_t *dst, uint8_t *key, int keylen) {
+  uint32_t acc = 0x67;
+  for (int i = 0; i < n; i++) {
+    acc += key[i % keylen] + i;
+    dst[i] = src[i] ^ (acc & 0xff);
+  }
+}
+```
+
+The key is the full text stored in `.init.constructors.global`, which is the Aggie War Hymn.
+
+Applying that decoder to `.bss.secure.buffer` produces:
+
+```text
+42 0c 00 00 3a 0c 00 00 78 9c ...
+```
+
+Two important details jump out immediately:
+
+- `0x00000c3a` is a plausible compressed length
+- `78 9c` is a zlib header
+
+So the section is not random data. It is a compressed second stage with a tiny custom wrapper header.
+
+## Recovering the Second Stage
+
+Once the custom decoder is emulated, the rest is mechanical:
+
+1. decode `.bss.secure.buffer`
+2. skip the 8-byte header
+3. read `compressed_size` from offset `+4`
+4. zlib-decompress the payload
+
+That produces a shared object:
+
+```bash
+$ file /tmp/stage.so
+/tmp/stage.so: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, BuildID[sha1]=12f49dfda6aaadc3dbbf18b8f4409e95d5dee2c6, not stripped
+
+$ nm -D /tmp/stage.so
+00000000000015b0 T run
+```
+
+This is the real payload.
+
+## Stage 2: The Shared Object Is Not Stripped
+
+This is where the challenge gets much easier.
+
+Strings from the shared object:
+
+```bash
+$ strings -a -n 4 /tmp/stage.so | head -n 80
+AggiesAggiesAggies
+/proc/self/status
+TracerPid:
+tracerpid_anti_debug
+check1
+check2
+check3
+perform_check
+run
+```
+
+Function list:
+
+```bash
+$ rizin -q -c 'aaa; afl' /tmp/stage.so
+0x000011b9    9 245          sym.tracerpid_anti_debug
+0x000012ae   12 632          sym.perform_check
+0x00001526    1 46           sym.check1
+0x00001554    1 46           sym.check2
+0x00001582    1 46           sym.check3
+0x000015b0   11 331          sym.run
+```
+
+The stage is basically:
+
+1. re-run a `TracerPid` anti-debug check
+2. if traced, corrupt its own RC4 key with XOR `0x13`
+3. decrypt three short hint strings through `check1/2/3`
+4. decrypt a larger final blob through the same `perform_check`
+5. if traced, corrupt the final output again with XOR `0x21`
+
+So the stage's anti-debug logic is sabotage, not protection.
+
+## `perform_check` Is RC4
+
+Once decompiled mentally, `perform_check` is recognizable as RC4:
+
+1. initialize `S[i] = i` for `i = 0..255`
+2. run the key scheduling algorithm using the provided key
+3. generate the keystream and XOR the target buffer in place
+
+The key used in the normal path is:
+
+```text
+AggiesAggiesAggies
+```
+
+This is why the partially decoded wrapper string still looked wrong earlier: the wrapper only got me to the stage, and the stage still had RC4-encrypted data in `.data`.
+
+## Decrypting the Stage Data
+
+The stage contains three short encrypted buffers and one final encrypted buffer.
+
+RC4-decrypting them with `AggiesAggiesAggies` yields:
+
+```text
+data1 -> "Yeah, this aint it"
+data2 -> "Keep going bruh"
+data3 -> "Are we there yet?"
+final -> "gigem{sh0uld_h4v3_r4n_th3_b411_0n_f1r$t_4nd_g04l!!!}"
+```
+
+Those three short strings are just decoys or breadcrumbs.
+
+The final buffer is the flag.
+
+## Solver Script
+
+I archived a deterministic solver for this challenge.
+
+It does the full solve from the original wrapper:
+
+1. parse ELF sections from `war-hymn`
+2. decode `.bss.secure.buffer` with the rolling hymn-based decoder
+3. zlib-decompress the second stage
+4. parse the stage sections
+5. RC4-decrypt the hints and the final flag
+
+Full script:
+
+```python
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import struct
+import zlib
+from pathlib import Path
+
+
+def read_elf_sections(path: str) -> tuple[bytes, dict[str, bytes]]:
+    blob = Path(path).read_bytes()
+    if blob[:4] != b"\x7fELF":
+        raise ValueError(f"{path!r} is not an ELF file")
+    if blob[4] != 2 or blob[5] != 1:
+        raise ValueError("only ELF64 little-endian files are supported")
+
+    shoff = struct.unpack_from("<Q", blob, 0x28)[0]
+    shentsize = struct.unpack_from("<H", blob, 0x3A)[0]
+    shnum = struct.unpack_from("<H", blob, 0x3C)[0]
+    shstrndx = struct.unpack_from("<H", blob, 0x3E)[0]
+
+    shstr_hdr = shoff + shentsize * shstrndx
+    shstr_off = struct.unpack_from("<Q", blob, shstr_hdr + 0x18)[0]
+    shstr_size = struct.unpack_from("<Q", blob, shstr_hdr + 0x20)[0]
+    shstr = blob[shstr_off : shstr_off + shstr_size]
+
+    sections: dict[str, bytes] = {}
+    for idx in range(shnum):
+        hdr = shoff + shentsize * idx
+        name_off = struct.unpack_from("<I", blob, hdr)[0]
+        sec_off = struct.unpack_from("<Q", blob, hdr + 0x18)[0]
+        sec_size = struct.unpack_from("<Q", blob, hdr + 0x20)[0]
+        name_end = shstr.find(b"\x00", name_off)
+        name = shstr[name_off:name_end].decode()
+        sections[name] = blob[sec_off : sec_off + sec_size]
+
+    return blob, sections
+
+
+def rolling_decode(ciphertext: bytes, key: bytes) -> bytes:
+    acc = 0x67
+    plaintext = bytearray(len(ciphertext))
+    for i, value in enumerate(ciphertext):
+        acc = (acc + key[i % len(key)] + i) & 0xFFFFFFFF
+        plaintext[i] = value ^ (acc & 0xFF)
+    return bytes(plaintext)
+
+
+def rc4(data: bytes, key: bytes) -> bytes:
+    s = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + s[i] + key[i % len(key)]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+
+    out = bytearray()
+    i = 0
+    j = 0
+    for byte in data:
+        i = (i + 1) & 0xFF
+        j = (j + s[i]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+        k = s[(s[i] + s[j]) & 0xFF]
+        out.append(byte ^ k)
+    return bytes(out)
+
+
+def recover_stage(wrapper_path: str) -> bytes:
+    _, sections = read_elf_sections(wrapper_path)
+    hymn = sections[".init.constructors.global"].rstrip(b"\x00")
+    secure_blob = sections[".bss.secure.buffer"]
+
+    decoded = rolling_decode(secure_blob, hymn)
+    compressed_size = struct.unpack_from("<I", decoded, 4)[0]
+    compressed = decoded[8 : 8 + compressed_size]
+    return zlib.decompress(compressed)
+
+
+def recover_flag(stage_blob: bytes) -> tuple[list[str], str]:
+    stage_path = Path("/tmp/stage-war-hymn.so")
+    stage_path.write_bytes(stage_blob)
+    _, sections = read_elf_sections(str(stage_path))
+
+    rodata = sections[".rodata"]
+    data = sections[".data"]
+
+    key = rodata.split(b"\x00", 1)[0]
+
+    hint1 = rc4(data[0x20:0x20 + 0x12], key).decode()
+    hint2 = rc4(data[0x38:0x38 + 0x0F], key).decode()
+    hint3 = rc4(data[0x50:0x50 + 0x11], key).decode()
+    flag = rc4(data[0x80:0x80 + 0x34], key).decode()
+    return [hint1, hint2, hint3], flag
+
+
+def main() -> None:
+    stage = recover_stage("war-hymn")
+    hints, flag = recover_flag(stage)
+
+    print("[+] stage extracted and decompressed")
+    for idx, hint in enumerate(hints, start=1):
+        print(f"[+] hint{idx}: {hint}")
+    print(f"[+] flag: {flag}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Running it:
+
+```bash
+$ python3 solve.py
+[+] stage extracted and decompressed
+[+] hint1: Yeah, this aint it
+[+] hint2: Keep going bruh
+[+] hint3: Are we there yet?
+[+] flag: gigem{sh0uld_h4v3_r4n_th3_b411_0n_f1r$t_4nd_g04l!!!}
+```
+
+## Pseudocode Summary
+
+The wrapper's real job is:
+
+```c
+int main(void) {
+  if (traced()) poison_some_constants();
+
+  start_network_thread();   // connect to 142.250.190.78:80 and block
+
+  decoder = extract_section("/proc/self/exe", ".init.checksum.validation");
+  secure  = extract_section("/proc/self/exe", ".bss.secure.buffer");
+  hymn    = extract_section("/proc/self/exe", ".init.constructors.global");
+
+  stage = zlib_decompress(rolling_decode(secure, hymn));
+  dlopen_memfd(stage);
+}
+```
+
+And the stage's useful logic is:
+
+```c
+void run(void) {
+  if (traced()) {
+    key ^= 0x13;       // sabotage branch
+  }
+
+  rc4(key, data1);
+  rc4(key, data2);
+  rc4(key, data3);
+  rc4(key, final_blob);
+
+  if (traced()) {
+    final_blob ^= 0x21;  // more sabotage
+  }
+}
+```
+
+Where:
+
+```text
+key = "AggiesAggiesAggies"
+```
+
+## Flag
+
+```text
+gigem{sh0uld_h4v3_r4n_th3_b411_0n_f1r$t_4nd_g04l!!!}
+```
+
+## Closing
+
+The wrapper tries hard to waste time:
+
+- it hangs instead of printing anything useful
+- it crashes under `strace`
+- it has a misleading `LD_PRELOAD` branch
+- it burns time in a network thread
+- it hides the real logic in a second-stage `.so`
+
+But once the custom section decoder is isolated, the rest becomes very mechanical:
+
+1. recover the stage
+2. notice the stage is not stripped
+3. recognize RC4
+4. decrypt the final `.data` blob
+
+The anti-debugging here is annoying, but it is also honest in a way: it mainly punishes bad dynamic-analysis choices. Static recovery is the intended shortcut.
+
+## References
+
+- [Rizin](https://rizin.re/)
+- [objdump](https://sourceware.org/binutils/docs/binutils/objdump.html)
+- [readelf](https://sourceware.org/binutils/docs/binutils/readelf.html)
+- [zlib format](https://www.rfc-editor.org/rfc/rfc1950)
+- [RC4 overview](https://en.wikipedia.org/wiki/RC4)

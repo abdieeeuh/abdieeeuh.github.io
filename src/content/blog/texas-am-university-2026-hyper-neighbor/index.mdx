@@ -1,0 +1,601 @@
+---
+title: 'Texas A&M University 2026 - hyper-neighbor'
+description: 'Reversing a Rust sender that leaks flag.txt over a cache side channel, then recovering the flag by iterating on a remote receiver and documenting the failed experiments.'
+date: 2026-03-21
+category: 'texas-am-university-2026'
+discipline: 'reverse-engineering'
+authors: ['abdieeuh']
+draft: false
+---
+
+> Note: I solved this challenge with LLM
+
+# hyper-neighbor
+
+## Intro
+
+The challenge description gives one concrete clue:
+
+```text
+hyper-neighbor flag.txt /lib/libc.musl-x86_64.so.1
+```
+
+So the attached binary is run with:
+
+1. a flag file as the first argument
+2. a shared system library as the second argument
+
+That is already suspicious. A normal file sender does not need `libc` as an input.
+
+The actual solve path turned out to be:
+
+1. reverse the binary until the transmission format is clear
+2. prove locally that it leaks data through a cache side channel
+3. build a receiver
+4. keep tuning the receiver on the remote host until enough chunks of the flag appear
+5. reconstruct the final flag from the recovered chunk map
+
+## Recon: What Is in the Distribution?
+
+The archive contains only a few files:
+
+```bash
+$ tar -tzf hyper-neighbor.tar.gz
+hyper-neighbor/
+hyper-neighbor/solver-template.py
+hyper-neighbor/hyper-neighbor
+hyper-neighbor/Dockerfile
+```
+
+Basic file triage:
+
+```bash
+$ file hyper-neighbor/hyper-neighbor
+hyper-neighbor/hyper-neighbor: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, not stripped
+
+$ sed -n '1,40p' hyper-neighbor/solver-template.py
+from pwn import *
+
+context.log_level = "debug"
+io = remote("streams.tamuctf.com", 443, ssl=True, sni="hyper-neighbor")
+io.interactive(prompt="")
+```
+
+The Dockerfile explains the deployment model:
+
+```bash
+$ sed -n '1,80p' hyper-neighbor/Dockerfile
+FROM alpine AS chal
+
+RUN apk add alpine-sdk util-linux-misc
+
+FROM pwn.red/jail
+
+COPY --from=chal / /srv
+COPY init.sh /srv/app/run
+
+ENV JAIL_TIME=300
+ENV JAIL_MEM=32M
+ENV JAIL_CPU=0
+ENV JAIL_PIDS=16
+ENV JAIL_POW=6000
+ENV JAIL_TMP_SIZE=128M
+```
+
+So the remote service is a shell jail, not a simple flag checker.
+
+## First Static Pass
+
+The binary is a Rust executable and keeps useful symbols:
+
+```bash
+$ nm -n hyper-neighbor/hyper-neighbor | rg 'send4main| main$'
+000000000000a043 t _RNvCscSszKCBdhcO_4send4main
+000000000000ade0 T main
+```
+
+Useful strings:
+
+```bash
+$ strings -a -n 3 hyper-neighbor/hyper-neighbor | rg -n 'Need a file|bin/send.rs|/proc/self/exe'
+5404:Need a file to send!bin/send.rs
+5590:/proc/self/exe
+5600:Need a file to send to!capacity overflow
+```
+
+So the crate/module name is effectively `send`, and it takes:
+
+1. a file to send
+2. a file to send to
+
+That still sounds normal until the second argument is `/lib/libc.musl-x86_64.so.1`.
+
+## Quick Dynamic Check
+
+Before digging through disassembly, I traced a local run with a dummy first argument:
+
+```bash
+$ printf 'testflag\n' > /tmp/flag.txt
+$ strace -o /tmp/hyper.strace -f ./hyper-neighbor/hyper-neighbor /tmp/flag.txt /lib/libc.musl-x86_64.so.1
+Error: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+```
+
+Relevant syscalls from the trace:
+
+```text
+open("/tmp/flag.txt", O_RDONLY|O_LARGEFILE|O_CLOEXEC) = 3
+read(3, "testflag\n", 9)                         = 9
+read(3, "", 32)                                  = 0
+close(3)                                         = 0
+open("/lib/libc.musl-x86_64.so.1", O_RDONLY|O_LARGEFILE|O_CLOEXEC) = -1 ENOENT
+```
+
+That already tells us two important facts:
+
+1. argument 1 is fully read into memory
+2. argument 2 is only opened afterward
+
+So the second file is not the source of the secret. It is the transport.
+
+## Reconstructing the Sender
+
+Disassembling `send::main` shows three distinct phases.
+
+### 1. Read the first file
+
+The first argument is opened and read to the end into a heap buffer.
+
+### 2. Detect cache line size with CPUID
+
+The binary uses `raw_cpuid` and branches on vendor strings:
+
+```bash
+$ objdump -s --start-address=0x54400 --stop-address=0x54440 hyper-neighbor/hyper-neighbor
+Contents of section .rodata:
+ 54400 6e646f72 53747269 6e674765 6e75696e  ndorStringGenuin
+ 54410 65496e74 656c4175 7468656e 74696341  eIntelAuthenticA
+ 54420 4d444879 676f6e47 656e7569 6e657b72  MDHygonGenuine{r
+```
+
+For Intel it walks deterministic cache parameters to find the L3 line size. For some AMD/Hygon cases it uses the extended leaves instead.
+
+### 3. Memory-map the second file and encode the data as cache activity
+
+This is the real payload:
+
+1. open second argument
+2. compute a mapping length of `line_size << 12`
+3. `mmap()` that file
+4. repeatedly `clflush` selected cache lines
+
+The key constants are visible in the disassembly:
+
+```text
+PREAMBLE   = 0xdeadbeef00000001
+TERMINATOR = 0xdeadbeef00000002
+LOOP_COUNT = 0x7a120 = 500000
+```
+
+The sender treats the shared mapping as 64 slots, one cache line apart. Each 64-bit word is transmitted as:
+
+```text
+word bit i == 1  -> repeatedly clflush(slot[i])
+word bit i == 0  -> leave slot[i] alone
+```
+
+A full frame is:
+
+1. preamble word
+2. one word per 4-byte chunk of the file
+3. terminator word
+4. `clock_nanosleep()` for 1 second
+5. repeat forever
+
+The per-chunk word format is:
+
+```text
+bits  0..31  : 4 bytes of file data, little-endian
+bits 32..47  : chunk index
+bits 48..63  : folded checksum
+```
+
+The checksum is:
+
+```c
+crc = crc32_u32(0xdeadbeef, chunk);
+crc = crc32_u16(crc, index);
+checksum = (crc ^ (crc >> 16)) & 0xffff;
+```
+
+## Local Proof of Concept
+
+At this point I wrote a receiver, `receiver.c`, that:
+
+1. computes the same cache line size logic
+2. maps the same shared file
+3. times accesses to the 64 candidate slots
+4. reconstructs words from slow lines
+5. validates chunk words with the checksum
+
+Local end-to-end testing was straightforward.
+
+Prepare a known message:
+
+```bash
+$ printf 'gigem{local_test_flag}\n' > /tmp/hyper_msg.txt
+```
+
+Run the sender in one terminal and the receiver in another:
+
+```bash
+$ ./hyper-neighbor/hyper-neighbor /tmp/hyper_msg.txt /bin/ls
+```
+
+```bash
+$ timeout 12s ./hyper-neighbor/receiver /bin/ls
+gigem{local_test_flag}
+```
+
+So the reversing result was correct. The binary really is a cache-based sender.
+
+## Remote Environment
+
+I then solved the proof-of-work and inspected the live shell.
+
+Basic environment:
+
+```text
+uid=1000 gid=1000 groups=1000
+/app
+/usr/bin/gcc
+apk
+firmware
+ld-musl-x86_64.so.1
+libc.musl-x86_64.so.1
+```
+
+`/app/run` was only:
+
+```bash
+#!/bin/ash
+
+exec /bin/ash
+```
+
+So there was no obvious wrapper script launching the sender in plain sight.
+
+The `/proc` view was also intentionally unhelpful:
+
+```bash
+$ ps -ef
+PID   USER     TIME  COMMAND
+    1 1000      0:00 /bin/ash
+    2 1000      0:00 ps -ef
+```
+
+And later:
+
+```bash
+$ python3 hyper-neighbor/remote_cmd.py 'grep -E "vendor_id|model name|clflush size" /proc/cpuinfo | sort -u; echo ---; nproc'
+cache size      : 16384 KB
+clflush size    : 64
+model name      : Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz
+vendor_id       : GenuineIntel
+---
+1
+```
+
+That `nproc = 1` detail mattered later. It explains why the first receiver designs starved the sender.
+
+## Experiment Log
+
+This is the actual sequence of experiments, including the failed ones.
+
+### Experiment 1: Compile the receiver remotely
+
+I first tried the obvious path: upload `receiver.c` and compile it in the jail.
+
+That failed:
+
+```text
+gcc: fatal error: cannot execute 'cc1': posix_spawnp: No such file or directory
+compilation terminated.
+```
+
+So `gcc` existed, but the full compiler toolchain did not. That forced a switch to uploading a prebuilt static receiver.
+
+### Experiment 2: Upload a static receiver and run it unchanged
+
+I built a static compatibility binary locally:
+
+```bash
+$ gcc -O2 -static -msse4.2 -march=x86-64 -Wall -Wextra -o hyper-neighbor/receiver-static-compat hyper-neighbor/receiver.c
+$ strip hyper-neighbor/receiver-static-compat
+```
+
+The first remote runs saw nothing useful:
+
+```text
+line_size=64 threshold=151 rounds=600
+flag not found
+```
+
+This told me the local logic was right, but the remote timing was wrong.
+
+### Experiment 3: Try FLUSH+FLUSH instead of read timing
+
+I rewrote the detector to time `clflush` directly instead of timing reads.
+
+That variant immediately degraded local reliability and produced no improvement remotely.
+
+So I reverted to read timing.
+
+### Experiment 4: Yield more aggressively
+
+The remote jail exposed only one logical CPU, so I tried:
+
+1. fewer measurement rounds
+2. explicit `nanosleep()`
+3. `sched_yield()`
+4. `nice -n 19`
+
+This finally produced a signal:
+
+```text
+line_size=64 threshold=151 rounds=1 wait_ns=10000000
+preamble
+chunk idx=0 checksum=dc4a data=65676967
+```
+
+So the side channel was present. The receiver just needed to stop monopolizing the CPU.
+
+### Experiment 5: Long-running accumulation
+
+I changed the receiver to keep valid chunks across repeated frames instead of requiring one contiguous perfect decode.
+
+This helped locally, but on remote it still did not finish in one long run. The receiver appeared to phase-lock onto the same chunk positions over and over.
+
+### Experiment 6: Jitter
+
+I added a random jitter term to the wait between prime and measure:
+
+```text
+RX_WAIT_NS
+RX_JITTER_NS
+RX_ROUNDS
+```
+
+That did not beat the simpler fixed wait on the live host.
+
+### Experiment 7: Upload my own sender as a self-test
+
+I uploaded another copy of the challenge binary, ran it myself with:
+
+```text
+gigem{remote_self_test}
+```
+
+and expected the receiver to decode that string.
+
+Instead, the recovered chunks still looked like the real flag stream, not my test string.
+
+That was a failed experiment, but a useful one:
+
+1. it proved the hidden sender was already active
+2. it showed my test process was not the dominant signal
+3. it confirmed that the receiver was seeing real remote traffic, not local artifacts
+
+### Experiment 8: Batch collection with many short-lived receivers
+
+The best result came from restarting a very sparse receiver many times instead of waiting inside one process.
+
+I built `collect_chunks.py` for that. The working cadence was:
+
+```text
+attempts = many
+timeout  = 5 seconds
+rounds   = 1
+wait_ns  = 1_000_000
+```
+
+That configuration finally surfaced a useful chunk map.
+
+## The Chunk Collection That Mattered
+
+This command produced the decisive output:
+
+```bash
+$ python3 hyper-neighbor/collect_chunks.py --attempts 20 --timeout 5 --rounds 1 --wait-ns 1000000 | rg 'preamble|chunk idx='
+```
+
+Key recovered chunks:
+
+```text
+idx=0   65676967  -> "gige"
+idx=2   65722d75  -> "u-re"
+idx=3   796c6c61  -> "ally"
+idx=4   65656e2d  -> "-nee"
+idx=5   6f742d64  -> "d-to"
+idx=6   6c61632d  -> "-cal"
+idx=7   6f642d6d  -> "m-do"
+idx=8   312d6e77  -> "wn-1"
+idx=9   30616130  -> "0aa0"
+idx=10  36363238  -> "8266"
+idx=11  37353930  -> "0957"
+idx=12  7d656666  -> "ffe}"
+```
+
+Everything is little-endian, so each `u32` must be read bytewise.
+
+Concatenating the recovered chunks gives:
+
+```text
+gige ???? u-re ally -nee d-to -cal m-do wn-1 0aa0 8266 0957 ffe}
+```
+
+With the flag format `gigem{...}`, the missing `idx=1` is uniquely constrained:
+
+```text
+idx=0 = "gige"
+idx=1 = "m{yo"
+idx=2 = "u-re"
+```
+
+That yields:
+
+```text
+gigem{you-really-need-to-calm-down-10aa082660957ffe}
+```
+
+I did not directly recover `idx=1` in the final batch, but every neighboring chunk, the flag format, and the English phrase were already fixed. There was no competing interpretation that fit the observed data.
+
+## Collector Script
+
+The batch collector I used is `collect_chunks.py`. Full version:
+
+```python
+#!/usr/bin/env python3
+
+import argparse
+import base64
+import re
+import subprocess
+import textwrap
+from pathlib import Path
+
+from pwn import remote
+
+
+HOST = "streams.tamuctf.com"
+PORT = 443
+SNI = "hyper-neighbor"
+
+
+def solve_pow(challenge: str) -> bytes:
+    return subprocess.check_output(
+        ["sh", "-lc", f"curl -sSfL https://pwn.red/pow | sh -s {challenge}"],
+        text=False,
+    ).strip()
+
+
+def upload(io, data: bytes, remote_path: str) -> None:
+    b64 = "\n".join(textwrap.wrap(base64.b64encode(data).decode(), 76))
+    marker = "__UPLOAD_DONE__"
+    cmd = (
+        f"busybox base64 -d >{remote_path} <<'EOF'\n"
+        f"{b64}\n"
+        f"EOF\n"
+        f"chmod +x {remote_path}\n"
+        f"echo {marker}\n"
+    )
+    io.send(cmd.encode())
+    io.recvuntil(f"{marker}\n".encode())
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--selftest", action="store_true")
+    parser.add_argument("--attempts", type=int, default=10)
+    parser.add_argument("--timeout", type=int, default=5)
+    parser.add_argument("--rounds", type=int, default=1)
+    parser.add_argument("--wait-ns", type=int, default=10_000_000)
+    parser.add_argument("--jitter-ns", type=int, default=0)
+    args = parser.parse_args()
+
+    rx = Path(__file__).with_name("receiver-static-compat-stripped").read_bytes()
+    tx = Path(__file__).with_name("hyper-neighbor").read_bytes()
+
+    io = remote(HOST, PORT, ssl=True, sni=SNI)
+    banner = io.recvuntil(b"solution: ")
+    challenge = re.search(rb"s\.[^\s]+", banner).group(0).decode()
+    io.sendline(solve_pow(challenge))
+
+    upload(io, rx, "/tmp/rx")
+    if args.selftest:
+        upload(io, tx, "/tmp/hn")
+
+    lines = []
+    if args.selftest:
+        lines.append('printf "gigem{remote_self_test}\\n" >/tmp/m')
+        lines.append("/tmp/hn /tmp/m /lib/libc.musl-x86_64.so.1 >/dev/null 2>&1 &")
+
+    for i in range(1, args.attempts + 1):
+        lines.append(f"echo TRY:{i}")
+        cmd = (
+            f"timeout {args.timeout} nice -n 19 env "
+            f"RX_DEBUG=1 RX_ROUNDS={args.rounds} RX_WAIT_NS={args.wait_ns} RX_JITTER_NS={args.jitter_ns} "
+            f"/tmp/rx /lib/libc.musl-x86_64.so.1"
+        )
+        lines.append(cmd)
+        lines.append("sleep 1")
+
+    io.sendline("\n".join(lines).encode())
+    print(io.recvrepeat(args.attempts * (args.timeout + 2) + 10).decode("latin1", "replace"))
+    io.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## Pseudocode Summary
+
+The sender reduces to something like this:
+
+```c
+buf = read_all(argv[1]);
+line_size = detect_l3_line_size_with_cpuid();
+shared = mmap(argv[2], line_size << 12, MAP_SHARED);
+
+while (1) {
+  send_word(0xdeadbeef00000001);
+
+  for (idx = 0; idx < ceil(len(buf) / 4); idx++) {
+    chunk = little_endian_u32(buf[idx*4 : idx*4+4]);
+    crc = crc32_u32(0xdeadbeef, chunk);
+    crc = crc32_u16(crc, idx);
+    checksum = (crc ^ (crc >> 16)) & 0xffff;
+    word = chunk | ((uint64_t)idx << 32) | ((uint64_t)checksum << 48);
+    send_word(word);
+  }
+
+  send_word(0xdeadbeef00000002);
+  sleep(1);
+}
+```
+
+Where:
+
+```c
+send_word(word):
+  repeat 500000 times:
+    for bit in 0..63:
+      if word & (1ULL << bit):
+        clflush(shared + bit * line_size)
+```
+
+## Flag
+
+```text
+gigem{you-really-need-to-calm-down-10aa082660957ffe}
+```
+
+## Closing
+
+The hard part of this challenge was not the Rust reversing. That part was fairly mechanical once the CPUID and `clflush` loops were recognized.
+
+The hard part was the remote signal acquisition:
+
+1. the toolchain inside the jail was incomplete
+2. the sender process was hidden
+3. the jail exposed effectively one CPU to us
+4. the naive local receiver worked, but the remote one starved the sender
+
+The final solve was mostly about controlling scheduling well enough to observe the side channel repeatedly, then being honest about which bytes were directly recovered and which one was inferred from the surrounding chunk map.
+
+## References
+
+- [Intel CLFLUSH reference](https://www.felixcloutier.com/x86/clflush)
+- [Intel CRC32 reference](https://www.felixcloutier.com/x86/crc32)
+- [Pwntools](https://docs.pwntools.com/)
+- [Linux `mmap(2)`](https://man7.org/linux/man-pages/man2/mmap.2.html)
