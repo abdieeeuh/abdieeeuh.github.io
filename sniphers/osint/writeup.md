@@ -1,11 +1,9 @@
 ---
 title: "Alias to Scene"
+ctf: "$N1PH€RS 3.0 CTF"
 date: 2026-08-23
-description: 'Tracing a public alias and calendar breadcrumb to identify a scene.'
-category: '$n1phers-3-0-ctf'
-discipline: 'osint'
-authors: ['abdieeuh']
-draft: false
+category: osint
+flag_format: "$N1PH€RSxTCTF{BIKE_COLOR_HELMET_BRAND}"
 ---
 
 # Alias to Scene
@@ -81,6 +79,20 @@ Inspecting the chase footage gives:
 
 - Bike color: **BLACK**
 - Helmet marking/brand requested by the challenge: **EXORCIST**
+
+The clip thumbnail also shows the black motorcycle:
+
+`https://i.ytimg.com/vi/Ixvgc7l0KyU/maxresdefault.jpg`
+
+The helmet marking is clearly visible in this frame:
+
+`https://pbs.twimg.com/media/GW5GsaOW4AED9MU?format=jpg&name=orig`
+
+For reproducibility, the downloaded JPEG was 1470×816 pixels with SHA-256:
+
+```text
+d787fd9da9c1baf9f1d17c07b29c7e704ec60af75af0c5f68d70e38bdce5aafa
+```
 
 ## Flag
 
