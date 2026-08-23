@@ -6,6 +6,8 @@ const LABEL_OVERRIDES: Record<string, string> = {
   'qualification-ara-7-0': 'Qualification ARA 7.0',
   'final-ara-7-0': 'Final ARA 7.0',
   'texas-am-university-2026': 'Texas A&M University 2026',
+  '$n1phers-3-0-ctf': '$N1PH€RS 3.0 CTF',
+  osint: 'OSINT',
   misc: 'Misc',
   'reverse-engineering': 'Reverse Engineering',
   'binary-exploitation': 'Binary Exploitation',
