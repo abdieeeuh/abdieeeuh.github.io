@@ -46,4 +46,5 @@ export const EVENT_CATEGORIES = [
   'qualification-ara-7-0',
   'final-ara-7-0',
   'texas-am-university-2026',
+  '$n1phers-3-0-ctf',
 ]
