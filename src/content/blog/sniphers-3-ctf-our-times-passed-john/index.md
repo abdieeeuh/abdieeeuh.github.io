@@ -16,7 +16,7 @@ The challenge gives us a very small menu and one unusual primitive: a single byt
 
 The technique chain is:
 
-1. Deterministic heap layout reconstruction
+1. Heap layout reconstruction
 2. One-byte tcache head overwrite
 3. Cross-bin tcache poisoning
 4. Safe-linking heap leak
