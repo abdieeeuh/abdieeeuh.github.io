@@ -36,7 +36,7 @@ iframe.setAttribute('src', src);
 There is no scheme validation before assigning `src`. The server also accepts
 oEmbed discovery from an arbitrary final page, not only from a fixed provider.
 
-### 2. Build a deterministic oEmbed response
+### 2. Build a oEmbed response
 
 [EchoServer](https://echoserver.dev/) was used as a URL-defined response
 server. The solver creates an HTML response containing an oEmbed discovery
