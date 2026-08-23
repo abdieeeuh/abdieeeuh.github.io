@@ -18,10 +18,6 @@ allows a `javascript:` URL to be placed in a newly created iframe. The admin
 bot visits reported chats, so the payload can read the admin page's
 non-HttpOnly cookies and submit them back into the reported chat.
 
-This is an unsafe same-origin JavaScript/XSS primitive rather than a pure
-XS-Leak side channel. The [OWASP XS-Leaks Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/XS_Leaks_Cheat_Sheet.html)
-was useful for classifying the behavior.
-
 ## Solution
 
 ### 1. Identify the preview sink
